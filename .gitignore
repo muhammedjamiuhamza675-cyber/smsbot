@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.textsms_state.json
+.textsms_state.json.tmp
+.env
+*.log
+.venv/
+venv/
