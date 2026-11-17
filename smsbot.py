@@ -1742,7 +1742,6 @@ async def show_pending(chat_id: int, msg_id: int, st: dict,
 # ---------------------------------------------------------------------------
 # Deposit flow (3 steps)
 # ---------------------------------------------------------------------------
-
 async def start_deposit_flow(chat_id: int, msg_id: int, uid: int,
                               st: dict, u: dict) -> None:
     cfg = settings(st).get("bank") or {}
@@ -1758,12 +1757,17 @@ async def start_deposit_flow(chat_id: int, msg_id: int, uid: int,
     await _edit(chat_id, msg_id,
                 f"💳 <b>Add Money</b>\n\n"
                 f"💰 Current balance: <b>{fmt_ngn(balance(u))}</b>\n\n"
-                f"<b>Step 1/3</b> — How much do you want to send?\n\n"
-                f"Type the amount in naira, e.g. <code>4000</code>\n\n"
-                f"Minimum: {fmt_ngn(cfg.get('min_deposit_ngn') or 1000)}",
+                f"<b>Step 1/3 — Transfer to this account:</b>\n"
+                f"🏛 {esc(cfg.get('bank_name'))}\n"
+                f"🔢 <code>{esc(cfg.get('account_number'))}</code>\n"
+                f"👤 {esc(cfg.get('account_name'))}\n\n"
+                f"Minimum: {fmt_ngn(cfg.get('min_deposit_ngn') or 1000)}\n\n"
+                f"After transferring, type the amount you sent "
+                f"(e.g. <code>4000</code>):",
                 reply_markup=inline_kb([
                     [ibtn("❌ Cancel", "menu:main")],
                 ]))
+
 
 async def show_bank_details(chat_id: int, msg_id: int, st: dict,
                              u: dict) -> None:
