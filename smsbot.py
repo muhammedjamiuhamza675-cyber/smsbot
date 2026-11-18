@@ -2,19 +2,20 @@
 textsms_bot.py — Telegram bot for textsms.io virtual number rentals.
 Raw Bot API + infinite polling loop. No Application/Updater framework.
 Railway-ready. Naira only. Admin-approved deposits. Auto-finish on code.
-Low-wallet notifications + auto-retry wake-up on restock.
 
-Deposit flow (bank only, 3 steps):
-    1. 💳 Add Money → shows account + asks amount
-    2. Buyer types amount → "Tap ✅ I have paid"
-    3. Buyer taps → asks for screenshot → "Wait for approval"
+Referral (single system):
+    • Inviter gets ₦200 + ₦100 = ₦300 when a referred user makes their
+      FIRST purchase (only).
+    • Bonus is credited to the inviter's referral pool, spendable on
+      numbers OR withdrawable via admin manual payout.
 
-Referral: legacy ₦200/₦200 milestone only. Invite system removed.
+Deposit flow: 3 steps (account shown first, then amount, then screenshot).
 
 Admin extras:
-    • Social links editor (Telegram channel/group, WhatsApp group/channel)
-    • Complaint inbox with reply routing
+    • Social links editor (TG channel/group, WA group/channel)
+    • Complaint inbox with reply routing (in-bot or /reply)
     • Broadcast with text + photo + video
+    • /paid and /withdrawfail for manual payout release
 """
 
 from __future__ import annotations
@@ -101,28 +102,20 @@ HELP_TEXT = (
     "you sent → tap ✅ I have paid → send a screenshot of your bank "
     "receipt → wait for admin approval.\n\n"
     "<b>Step 2 — Buy a number</b>\n"
-    "Tap 📱 Buy. Browse the services (WhatsApp, Telegram, Instagram, "
-    "TikTok, Facebook, Google, and hundreds more). Tap the app you "
-    "need. Confirm the price. The number appears in the chat in "
-    "seconds.\n\n"
+    "Tap 📱 Buy. Browse the services and tap the one you need.\n\n"
     "<b>Step 3 — Get your code</b>\n"
-    "Enter the number in the app you're verifying. We're watching "
-    "the number 24/7. The moment the code arrives, we send it here "
-    "automatically — no button press needed.\n\n"
+    "Enter the number in the app you're verifying. We watch the number "
+    "24/7. The moment the code arrives, we send it here automatically.\n\n"
     "<b>Step 4 — Refunds</b>\n"
     "No code? Full refund, automatic. You can also cancel manually "
-    "after 2 minutes if you change your mind.\n\n"
+    "after 2 minutes.\n\n"
+    "<b>🎁 Referral program</b>\n"
+    "Invite friends. When a friend buys their first number, you earn "
+    "<b>₦300</b> instantly. Spend it on numbers or withdraw it to your "
+    "bank — your choice.\n\n"
     "<b>Bottom menu</b>\n"
-    "📱 Buy — browse numbers\n"
-    "💰 Balance — check your money\n"
-    "💳 Add Money — deposit\n"
-    "📜 History — past orders\n"
-    "🔄 Active — open numbers\n"
-    "🌐 Channels — join our Telegram & WhatsApp\n"
-    "🆘 Support — message admin or send a complaint\n"
-    "ℹ️ Help — this guide\n\n"
-    "<b>Commands</b>\n"
-    "/start /help /balance /history /cancel\n\n"
+    "📱 Buy · 💰 Balance · 💳 Add Money · 📜 History\n"
+    "🔄 Active · 🌐 Channels · 🎁 Referral · 🆘 Support · ℹ️ Help\n\n"
     "Questions? Tap 🆘 Support or message the admin directly."
 )
 
@@ -175,9 +168,7 @@ def ts_str(ts: Any) -> str:
 def admin_link(st: dict) -> str | None:
     s = settings(st)
     handle = (s.get("admin_username") or ADMIN_USERNAME or "").lstrip("@")
-    if handle:
-        return f"https://t.me/{handle}"
-    return None
+    return f"https://t.me/{handle}" if handle else None
 
 # ---------------------------------------------------------------------------
 # textsms.io client
@@ -309,18 +300,6 @@ class TelegramBot:
                     params[k] = v
         return await self._call("sendVideo", **params)
 
-    async def copy_message(self, chat_id: int, from_chat_id: int,
-                           message_id: int, **kw) -> dict:
-        params = {"chat_id": chat_id, "from_chat_id": from_chat_id,
-                  "message_id": message_id}
-        for k, v in kw.items():
-            if v is not None:
-                if isinstance(v, (dict, list)):
-                    params[k] = json.dumps(v)
-                else:
-                    params[k] = v
-        return await self._call("copyMessage", **params)
-
     async def edit_message_text(self, chat_id: int, message_id: int,
                                  text: str, **kw) -> dict:
         params = {"chat_id": chat_id, "message_id": message_id, "text": text}
@@ -426,7 +405,7 @@ def new_user(uid: int, name: str = "") -> dict:
         "banned": False,
         "successful_rentals": 0,
         "referral": {},
-        "invite": {},  # kept for backward compat, unused
+        "invite": {},
         "started": False,
     }
 
@@ -449,8 +428,8 @@ SETTINGS_DEFAULT = {
     "referral": {
         "enabled": False,
         "bonus_first_ngn": 200,
-        "bonus_second_ngn": 200,
-        "min_withdraw_ngn": 1000,
+        "bonus_extra_ngn": 100,
+        "min_withdraw_ngn": 500,
     },
     "socials": {
         "telegram_channel": "",
@@ -462,7 +441,6 @@ SETTINGS_DEFAULT = {
     "admin_low_wallet_alert_ts": 0.0,
     "complaints": {},
     "complaint_counter": 1000,
-    "pending_reply": {},
 }
 
 _STATE: dict | None = None
@@ -534,19 +512,62 @@ def gateway(st: dict) -> TextSMS:
     return TextSMS(key)
 
 # ---------------------------------------------------------------------------
-# Money
+# Wallet: spendable = balance + referral pool
 # ---------------------------------------------------------------------------
 
 def balance(u: dict) -> float:
     return float(u.get("balance") or 0.0)
 
+def referral_available(u: dict) -> float:
+    r = u.get("referral") or {}
+    earned = float(r.get("earnings_ngn") or 0)
+    spent = float(r.get("spent_on_numbers_ngn") or 0)
+    paid = float(r.get("paid_out_ngn") or 0)
+    reserved = float(r.get("reserved_ngn") or 0)
+    return max(0.0, earned - spent - paid - reserved)
+
+def total_spendable(u: dict) -> float:
+    return balance(u) + referral_available(u)
+
 def add_balance(u: dict, n: float) -> None:
     with _STATE_LOCK:
         u["balance"] = max(0.0, balance(u) + float(n))
 
-def charge_balance(u: dict, n: float) -> None:
+def charge_balance(u: dict, n: float) -> dict:
+    """Charge spendable total: drain real balance first, then referral pool.
+    Returns {'from_balance': x, 'from_referral': y}."""
+    n = float(n)
     with _STATE_LOCK:
-        u["balance"] = max(0.0, balance(u) - float(n))
+        from_bal = min(balance(u), n)
+        u["balance"] = max(0.0, balance(u) - from_bal)
+        remaining = n - from_bal
+        from_ref = 0.0
+        if remaining > 0:
+            avail = referral_available(u)
+            from_ref = min(avail, remaining)
+            r = u.setdefault("referral", {})
+            r["spent_on_numbers_ngn"] = (
+                float(r.get("spent_on_numbers_ngn") or 0) + from_ref)
+        return {"from_balance": from_bal, "from_referral": from_ref}
+
+def refund_balance(u: dict, n: float, source: dict | None = None) -> None:
+    """Refund a charge. If source dict is provided, put money back where it
+    came from; otherwise, refund to real balance."""
+    n = float(n)
+    if not n:
+        return
+    if source:
+        back_ref = float(source.get("from_referral") or 0)
+        back_bal = float(source.get("from_balance") or 0)
+        if back_bal > 0:
+            add_balance(u, back_bal)
+        if back_ref > 0:
+            with _STATE_LOCK:
+                r = u.setdefault("referral", {})
+                r["spent_on_numbers_ngn"] = max(
+                    0.0, float(r.get("spent_on_numbers_ngn") or 0) - back_ref)
+        return
+    add_balance(u, n)
 
 def rate_ok(u: dict, per_minute: int) -> bool:
     now = time.time()
@@ -610,7 +631,7 @@ async def fetch_services_cached(st: dict, force: bool = False) -> list[dict]:
         return _CATALOGUE_CACHE["services"]
 
 # ---------------------------------------------------------------------------
-# Legacy milestone referral (₦200 / ₦200)
+# Referral — ₦300 on referred user's FIRST purchase only
 # ---------------------------------------------------------------------------
 
 def ensure_referral(u: dict) -> dict:
@@ -619,6 +640,7 @@ def ensure_referral(u: dict) -> dict:
         r["code"] = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8].upper()
     r.setdefault("referred_by", None)
     r.setdefault("earnings_ngn", 0.0)
+    r.setdefault("spent_on_numbers_ngn", 0.0)
     r.setdefault("paid_out_ngn", 0.0)
     r.setdefault("reserved_ngn", 0.0)
     r.setdefault("events", [])
@@ -636,6 +658,8 @@ def find_referral_owner(st: dict, code: str) -> int | None:
     return None
 
 def apply_referral_bonus(st: dict, buyer_uid: int, rental_id: int) -> dict | None:
+    """Credit the inviter ₦200 + ₦100 = ₦300 on the referred user's FIRST
+    purchase only. No second milestone."""
     buyer = get_user(st, buyer_uid)
     r = ensure_referral(buyer)
     inviter_uid = r.get("referred_by")
@@ -645,34 +669,31 @@ def apply_referral_bonus(st: dict, buyer_uid: int, rental_id: int) -> dict | Non
     if not cfg.get("enabled"):
         return None
     done = int(buyer.get("successful_rentals") or 0)
-    milestone = None
-    amount = 0.0
-    if done == 1 and "first_purchase" not in r["milestones_hit"]:
-        milestone = "first_purchase"
-        amount = float(cfg.get("bonus_first_ngn") or 200)
-    elif done == 2 and "second_purchase" not in r["milestones_hit"]:
-        milestone = "second_purchase"
-        amount = float(cfg.get("bonus_second_ngn") or 200)
-    if not milestone:
+    if done != 1:
         return None
+    if "first_purchase" in r["milestones_hit"]:
+        return None
+    base = float(cfg.get("bonus_first_ngn") or 200)
+    extra = float(cfg.get("bonus_extra_ngn") or 100)
+    total = base + extra
     try:
         inviter = get_user(st, int(inviter_uid))
     except (TypeError, ValueError):
         return None
     ir = ensure_referral(inviter)
-    ir["earnings_ngn"] = float(ir.get("earnings_ngn") or 0) + amount
+    ir["earnings_ngn"] = float(ir.get("earnings_ngn") or 0) + total
     ir["events"].append({
         "ts": time.time(), "kind": "referral_bonus",
-        "milestone": milestone, "amount_ngn": amount,
+        "amount_ngn": total, "base_ngn": base, "extra_ngn": extra,
         "from_uid": buyer_uid, "rental_id": rental_id,
     })
-    r["milestones_hit"].append(milestone)
-    return {"inviter_uid": int(inviter_uid), "amount": amount,
-            "milestone": milestone,
-            "inviter_earnings": ir["earnings_ngn"]}
+    r["milestones_hit"].append("first_purchase")
+    return {"inviter_uid": int(inviter_uid), "amount": total,
+            "base": base, "extra": extra,
+            "inviter_available": referral_available(inviter)}
 
 # ---------------------------------------------------------------------------
-# Complaints system
+# Complaints
 # ---------------------------------------------------------------------------
 
 def next_complaint_id(st: dict) -> int:
@@ -786,14 +807,13 @@ def welcome_text(u: dict, admin: bool) -> str:
 def thank_you_card(u: dict) -> str:
     return (
         "🎉 <b>Thank you for your purchase!</b>\n\n"
-        f"💰 Your remaining balance: <b>{fmt_ngn(balance(u))}</b>\n\n"
+        f"💰 Your spendable balance: <b>{fmt_ngn(total_spendable(u))}</b>\n\n"
         "🚀 More features coming soon — stay tuned!\n\n"
         "🆘 Need help? Tap <b>Support</b> below or message the admin."
     )
 
 def channels_card(st: dict) -> tuple[str, dict]:
-    s = settings(st)
-    soc = s.get("socials") or {}
+    soc = settings(st).get("socials") or {}
     lines = ["🌐 <b>Our Channels & Groups</b>\n",
              "Join any of these to stay updated:\n"]
     rows = []
@@ -803,16 +823,12 @@ def channels_card(st: dict) -> tuple[str, dict]:
     wa_ch = (soc.get("whatsapp_channel") or "").strip()
     if tg_ch:
         rows.append([{"text": "📢 Telegram Channel", "url": tg_ch}])
-        lines.append("📢 Telegram Channel — available")
     if tg_gr:
         rows.append([{"text": "💬 Telegram Group", "url": tg_gr}])
-        lines.append("💬 Telegram Group — available")
     if wa_gr:
         rows.append([{"text": "🟢 WhatsApp Group", "url": wa_gr}])
-        lines.append("🟢 WhatsApp Group — available")
     if wa_ch:
         rows.append([{"text": "🟩 WhatsApp Channel", "url": wa_ch}])
-        lines.append("🟩 WhatsApp Channel — available")
     if not rows:
         lines = ["🌐 <b>Our Channels</b>\n\n"
                  "No channels added yet. Check back soon!"]
@@ -823,12 +839,9 @@ def support_card(st: dict) -> tuple[str, dict]:
     link = admin_link(st)
     text = (
         "🆘 <b>Support</b>\n\n"
-        "Need help? You can:\n\n"
-        "💬 <b>Message the admin directly</b> — for urgent questions, "
-        "delayed codes, or deposit issues.\n\n"
-        "✍️ <b>Send a complaint</b> — describe your problem, and it "
-        "will be forwarded to the admin with a ticket number. The admin "
-        "will reply to you here.\n\n"
+        "💬 <b>Message the admin directly</b> — for urgent questions.\n\n"
+        "✍️ <b>Send a complaint</b> — describe your problem, get a "
+        "ticket number, and the admin will reply here.\n\n"
         "⏱ Typical reply: within a few minutes."
     )
     rows = []
@@ -849,7 +862,8 @@ def session(uid: int) -> dict:
     if s is None:
         s = {"state": None, "admin_state": None, "svc_country": None,
              "svc_query": "", "price_sid": None, "bulk": None,
-             "dep_amount": None, "socials_key": None}
+             "dep_amount": None, "socials_key": None,
+             "withdraw_amount": None, "broadcast_payload": {}}
         _SESSIONS[uid] = s
     return s
 
@@ -864,14 +878,14 @@ async def cmd_start(update: dict) -> None:
     u = get_user(st, uid, m["from"].get("first_name") or "")
     ses = session(uid)
     for k in list(ses.keys()):
-        ses[k] = None if k not in ("svc_query",) else ""
+        ses[k] = None if k not in ("svc_query", "broadcast_payload") else (
+            "" if k == "svc_query" else {})
     admin = is_owner(uid, st)
 
     if u.get("banned") and not admin:
         await bot.send_message(
             m["chat"]["id"],
-            "⛔ <b>Your account has been suspended.</b>\n"
-            "Contact admin if you believe this is a mistake.",
+            "⛔ <b>Your account has been suspended.</b>",
             parse_mode="HTML")
         return
 
@@ -892,8 +906,7 @@ async def cmd_start(update: dict) -> None:
 
     await bot.send_message(
         m["chat"]["id"], welcome_text(u, admin),
-        parse_mode="HTML",
-        reply_markup=reply_keyboard(admin))
+        parse_mode="HTML", reply_markup=reply_keyboard(admin))
 
 async def cmd_help(update: dict) -> None:
     m = update["message"]
@@ -909,7 +922,8 @@ async def cmd_cancel(update: dict) -> None:
     uid = m["from"]["id"]
     ses = session(uid)
     for k in list(ses.keys()):
-        ses[k] = None if k not in ("svc_query",) else ""
+        ses[k] = None if k not in ("svc_query", "broadcast_payload") else (
+            "" if k == "svc_query" else {})
     await bot.send_message(m["chat"]["id"], "✅ Cancelled.",
                            reply_markup=reply_keyboard(admin))
 
@@ -918,10 +932,13 @@ async def cmd_balance(update: dict) -> None:
     st = load_state()
     u = get_user(st, m["from"]["id"])
     admin = is_owner(m["from"]["id"], st)
-    await bot.send_message(
-        m["chat"]["id"],
-        f"💰 <b>Your balance:</b> {fmt_ngn(balance(u))}",
-        parse_mode="HTML", reply_markup=reply_keyboard(admin))
+    ref_av = referral_available(u)
+    text = f"💰 <b>Your balance:</b> {fmt_ngn(balance(u))}"
+    if ref_av > 0:
+        text += (f"\n🎁 <b>Referral credit:</b> {fmt_ngn(ref_av)}"
+                 f"\n\n🧮 <b>Total spendable:</b> {fmt_ngn(total_spendable(u))}")
+    await bot.send_message(m["chat"]["id"], text, parse_mode="HTML",
+                           reply_markup=reply_keyboard(admin))
 
 async def cmd_history(update: dict) -> None:
     m = update["message"]
@@ -937,6 +954,138 @@ async def cmd_admin(update: dict) -> None:
         return
     await bot.send_message(m["chat"]["id"], "👑 <b>Admin panel</b>",
                            parse_mode="HTML", reply_markup=admin_menu(st))
+
+async def cmd_paid(update: dict) -> None:
+    m = update["message"]
+    st = load_state()
+    if not is_owner(m["from"]["id"], st):
+        return
+    parts = (m.get("text") or "").split()
+    if len(parts) < 2:
+        await bot.send_message(m["chat"]["id"],
+                               "Usage: /paid <WITHDRAWAL_ID>")
+        return
+    wid = parts[1].strip().upper()
+    found = False
+    found_uid = None
+    found_amount = 0.0
+    for uid_str, u in st.get("users", {}).items():
+        r = u.get("referral") or {}
+        for e in (r.get("events") or []):
+            if (e.get("withdrawal_id") == wid
+                    and e.get("status") in ("pending", "processing")):
+                amount = float(e.get("amount_ngn") or 0)
+                r["reserved_ngn"] = max(0.0,
+                                        float(r.get("reserved_ngn") or 0)
+                                        - amount)
+                r["paid_out_ngn"] = (float(r.get("paid_out_ngn") or 0)
+                                     + amount)
+                e["status"] = "paid"
+                e["paid_ts"] = time.time()
+                found = True
+                found_uid = int(uid_str)
+                found_amount = amount
+                break
+        if found:
+            break
+    if not found:
+        await bot.send_message(m["chat"]["id"], "❌ Not found.")
+        return
+    save_state()
+    if found_uid:
+        try:
+            await bot.send_message(
+                found_uid,
+                f"💵 <b>Withdrawal paid</b>\n\n"
+                f"Amount: {fmt_ngn(found_amount)}\nID: {wid}",
+                parse_mode="HTML")
+        except Exception as ex:
+            log.warning("paid DM: %s", ex)
+    await bot.send_message(m["chat"]["id"], f"✅ {wid} marked paid.")
+
+async def cmd_withdrawfail(update: dict) -> None:
+    m = update["message"]
+    st = load_state()
+    if not is_owner(m["from"]["id"], st):
+        return
+    parts = (m.get("text") or "").split()
+    if len(parts) < 2:
+        await bot.send_message(m["chat"]["id"],
+                               "Usage: /withdrawfail <ID> [reason]")
+        return
+    wid = parts[1].strip().upper()
+    reason = " ".join(parts[2:]) or "processing error"
+    found = False
+    found_uid = None
+    found_amount = 0.0
+    for uid_str, u in st.get("users", {}).items():
+        r = u.get("referral") or {}
+        for e in (r.get("events") or []):
+            if (e.get("withdrawal_id") == wid
+                    and e.get("status") in ("pending", "processing")):
+                amount = float(e.get("amount_ngn") or 0)
+                r["reserved_ngn"] = max(0.0,
+                                        float(r.get("reserved_ngn") or 0)
+                                        - amount)
+                e["status"] = "failed"
+                e["failed_ts"] = time.time()
+                e["fail_reason"] = reason
+                found = True
+                found_uid = int(uid_str)
+                found_amount = amount
+                break
+        if found:
+            break
+    if not found:
+        await bot.send_message(m["chat"]["id"], "❌ Not found.")
+        return
+    save_state()
+    if found_uid:
+        try:
+            await bot.send_message(
+                found_uid,
+                f"⚠️ <b>Withdrawal failed</b>\n\n"
+                f"Amount: {fmt_ngn(found_amount)}\n"
+                f"Reason: {esc(reason)}\n\n"
+                f"Returned to your referral pool.",
+                parse_mode="HTML", reply_markup=back_menu())
+        except Exception as ex:
+            log.warning("wdfail DM: %s", ex)
+    await bot.send_message(m["chat"]["id"], f"✅ {wid} failed, returned.")
+
+async def cmd_reply(update: dict) -> None:
+    m = update["message"]
+    st = load_state()
+    if not is_owner(m["from"]["id"], st):
+        return
+    parts = (m.get("text") or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await bot.send_message(m["chat"]["id"],
+                               "Usage: /reply <ticket> <message>")
+        return
+    ticket = parts[1].lstrip("#")
+    body = parts[2]
+    s = settings(st)
+    comps = s.setdefault("complaints", {})
+    c = comps.get(ticket)
+    if not c:
+        await bot.send_message(m["chat"]["id"], "❌ Ticket not found.")
+        return
+    c.setdefault("replies", []).append({
+        "ts": time.time(), "text": body, "by": "admin",
+    })
+    c["status"] = "answered"
+    save_state()
+    try:
+        await bot.send_message(
+            int(c["uid"]),
+            f"📬 <b>Admin reply to your complaint #{ticket}</b>\n\n"
+            f"{esc(body)}",
+            parse_mode="HTML", reply_markup=back_menu())
+    except Exception as e:
+        log.warning("reply DM: %s", e)
+    await bot.send_message(m["chat"]["id"],
+                           f"✅ Reply sent to user {c['uid']}.")
 
 # ---------------------------------------------------------------------------
 # Callbacks
@@ -983,15 +1132,17 @@ async def on_callback(update: dict) -> None:
         ses["state"] = "complaint_text"
         await _edit(chat_id, msg_id,
                     "✍️ <b>Send a Complaint</b>\n\n"
-                    "Describe your problem in one message. Be specific: "
-                    "what happened, which number, when.\n\n"
-                    "The admin will get it with a ticket number and reply "
-                    "to you here.\n\n"
+                    "Describe your problem in one message.\n\n"
                     "/cancel to abort.",
                     reply_markup=back_menu())
     elif data == "menu:balance":
-        await _edit(chat_id, msg_id,
-                    f"💰 <b>Your balance:</b> {fmt_ngn(balance(u))}",
+        ref_av = referral_available(u)
+        text = f"💰 <b>Your balance:</b> {fmt_ngn(balance(u))}"
+        if ref_av > 0:
+            text += (f"\n🎁 <b>Referral credit:</b> {fmt_ngn(ref_av)}"
+                     f"\n\n🧮 <b>Total spendable:</b> "
+                     f"{fmt_ngn(total_spendable(u))}")
+        await _edit(chat_id, msg_id, text,
                     reply_markup=main_menu(admin, u))
     elif data == "menu:history":
         await send_history_cb(chat_id, msg_id, st, u)
@@ -1017,8 +1168,7 @@ async def on_callback(update: dict) -> None:
         ses["state"] = "await_svc_query"
         await _edit(chat_id, msg_id,
                     "🔍 <b>Search</b>\n\n"
-                    "Type what you need — e.g. <code>whatsapp</code>, "
-                    "<code>telegram</code>, <code>instagram</code>.\n\n"
+                    "Type what you need — e.g. <code>whatsapp</code>.\n\n"
                     "Send <code>*</code> to clear.",
                     reply_markup=back_menu())
     elif data.startswith("svc:pick:"):
@@ -1049,6 +1199,10 @@ async def on_callback(update: dict) -> None:
         await confirm_deposit_paid(chat_id, msg_id, uid, st, u)
     elif data == "menu:referral":
         await show_referral(chat_id, msg_id, st, u)
+    elif data == "ref:withdraw":
+        await request_referral_withdrawal(chat_id, msg_id, uid, st, u)
+    elif data == "ref:withdraw_confirm":
+        await confirm_referral_withdrawal(chat_id, msg_id, uid, st, u)
     elif data == "ref:history":
         await show_referral_history(chat_id, msg_id, st, u)
     elif data == "menu:pending":
@@ -1122,8 +1276,7 @@ async def show_services(chat_id: int, msg_id: int, st: dict, query: str,
     sellable = [s for s in services if price_in_ngn(st, s.get("id")) is not None]
     if not sellable:
         await _edit(chat_id, msg_id,
-                    "📱 <b>No services available right now</b>\n\n"
-                    "Try a different country or check back later.",
+                    "📱 <b>No services available right now</b>",
                     reply_markup=inline_kb([
                         [ibtn("🔍 Search", "svc:search")],
                         [ibtn("🌍 All countries", "svc:country:")],
@@ -1151,26 +1304,30 @@ async def confirm_rent(chat_id: int, msg_id: int, st: dict, u: dict,
         await _edit(chat_id, msg_id, "⚠️ Not for sale.",
                     reply_markup=back_menu())
         return
-    bal = balance(u)
-    can_afford = bal >= price
+    spendable = total_spendable(u)
+    can_afford = spendable >= price
     rows = []
     if can_afford:
         rows.append([ibtn(f"✅ Buy for {fmt_ngn(price)}", f"svc:rent:{sid}")])
     else:
-        need = price - bal
+        need = price - spendable
         rows.append([ibtn(f"💳 Add {fmt_ngn(need)} to buy", "menu:topup")])
     rows.append([ibtn("⬅️ Back", "menu:services")])
     rows.append([ibtn("⬅️ Main menu", "menu:main")])
+    ref_av = referral_available(u)
     text = (
         f"📱 <b>{esc(match.get('name'))}</b>\n"
         f"🌍 Country: {esc(match.get('country_name'))}\n\n"
         f"💵 Price: <b>{fmt_ngn(price)}</b>\n"
-        f"💰 Your balance: <b>{fmt_ngn(bal)}</b>\n"
+        f"💰 Balance: <b>{fmt_ngn(balance(u))}</b>\n"
     )
+    if ref_av > 0:
+        text += f"🎁 Referral credit: <b>{fmt_ngn(ref_av)}</b>\n"
+    text += f"\n🧮 Total spendable: <b>{fmt_ngn(spendable)}</b>\n"
     if can_afford:
-        text += f"\n✅ After purchase: <b>{fmt_ngn(bal - price)}</b> left."
+        text += f"✅ After purchase: <b>{fmt_ngn(spendable - price)}</b> left."
     else:
-        text += f"\n⚠️ You need <b>{fmt_ngn(price - bal)}</b> more."
+        text += f"⚠️ You need <b>{fmt_ngn(price - spendable)}</b> more."
     await _edit(chat_id, msg_id, text, reply_markup=inline_kb(rows))
 
 # ---------------------------------------------------------------------------
@@ -1204,10 +1361,10 @@ async def do_rent(chat_id: int, msg_id: int, st: dict, u: dict,
         await _edit(chat_id, msg_id, "⚠️ Not for sale.",
                     reply_markup=back_menu())
         return
-    if balance(u) < price:
+    if total_spendable(u) < price:
         await _edit(chat_id, msg_id,
-                    f"💳 Not enough balance.\n"
-                    f"Need {fmt_ngn(price)}, have {fmt_ngn(balance(u))}.",
+                    f"💳 Not enough spendable.\n"
+                    f"Need {fmt_ngn(price)}, have {fmt_ngn(total_spendable(u))}.",
                     reply_markup=main_menu(is_owner(u["uid"], st), u))
         return
     provider_price = float(match.get("price") or 0)
@@ -1256,8 +1413,18 @@ async def _execute_rent(chat_id: int | None, msg_id: int | None, st: dict,
             await _edit(chat_id, msg_id, "⚠️ No rental id in response.",
                         reply_markup=back_menu())
         return False
+
+    # charge BEFORE marking successful_rentals so referral can see
+    # "done == 1" only after a successful rental (rental exists).
+    charge_src = None
     if not from_queue:
-        charge_balance(u, price_ngn)
+        charge_src = charge_balance(u, price_ngn)
+
+    # increment successful_rentals AFTER the charge — this is what triggers
+    # the referral bonus for the inviter (buyer's first purchase).
+    prev_done = int(u.get("successful_rentals") or 0)
+    u["successful_rentals"] = prev_done + 1
+
     u.setdefault("active_rentals", {})[str(rid)] = {
         "id": rid,
         "order_id": rental.get("order_id"),
@@ -1273,8 +1440,10 @@ async def _execute_rent(chat_id: int | None, msg_id: int | None, st: dict,
         "code": "",
         "started_ts": time.time(),
         "waiting_reminder_sent": False,
+        "charge_source": charge_src or {"from_balance": 0.0,
+                                         "from_referral": 0.0},
     }
-    u["successful_rentals"] = int(u.get("successful_rentals") or 0) + 1
+
     bonus = apply_referral_bonus(st, u["uid"], rid)
     save_state()
 
@@ -1282,14 +1451,20 @@ async def _execute_rent(chat_id: int | None, msg_id: int | None, st: dict,
         try:
             await bot.send_message(
                 bonus["inviter_uid"],
-                f"🎉 <b>Referral bonus</b>\n\n"
-                f"A friend you invited made their "
-                f"{'first' if bonus['milestone'] == 'first_purchase' else 'second'} "
-                f"purchase.\n"
-                f"💸 +{fmt_ngn(bonus['amount'])}\n"
-                f"💰 Earnings: <b>{fmt_ngn(bonus['inviter_earnings'])}</b>",
+                f"🎉 <b>Referral bonus!</b>\n\n"
+                f"A friend you invited just made their first purchase.\n\n"
+                f"💸 Base: {fmt_ngn(bonus['base'])}\n"
+                f"🎁 Extra: {fmt_ngn(bonus['extra'])}\n"
+                f"💰 <b>Total credited: {fmt_ngn(bonus['amount'])}</b>\n\n"
+                f"🧮 Referral balance: "
+                f"<b>{fmt_ngn(bonus['inviter_available'])}</b>\n\n"
+                f"Spend it on a number or withdraw it from 🎁 Referral.",
                 parse_mode="HTML",
-                reply_markup=inline_kb([[ibtn("🎁 Referral", "menu:referral")]]))
+                reply_markup=inline_kb([
+                    [ibtn("📱 Buy with credit", "menu:services")],
+                    [ibtn("💵 Withdraw", "ref:withdraw")],
+                    [ibtn("🎁 Referral", "menu:referral")],
+                ]))
         except Exception as e:
             log.warning("referral DM: %s", e)
 
@@ -1297,15 +1472,14 @@ async def _execute_rent(chat_id: int | None, msg_id: int | None, st: dict,
         try:
             await bot.send_message(
                 u["uid"],
-                f"✅ <b>The server is live now — your number is ready</b>\n\n"
+                f"✅ <b>Server live — your number is ready</b>\n\n"
                 f"📱 {esc(rental.get('service'))}\n"
                 f"🌍 {esc(match.get('country_name'))}\n"
                 f"📞 Number: <code>{esc(rental.get('number'))}</code>\n"
                 f"💵 Paid: {fmt_ngn(price_ngn)}\n"
-                f"💰 Balance: {fmt_ngn(balance(u))}\n\n"
-                "Use this number in the app to request your code. "
-                "We'll send it the moment it arrives — no button press "
-                "needed.",
+                f"🧮 Spendable: <b>{fmt_ngn(total_spendable(u))}</b>\n\n"
+                "Use this number in the app — we'll send the code the "
+                "moment it arrives.",
                 parse_mode="HTML",
                 reply_markup=inline_kb([
                     [ibtn("🔄 Refresh", f"act:refresh:{rid}")],
@@ -1320,10 +1494,9 @@ async def _execute_rent(chat_id: int | None, msg_id: int | None, st: dict,
                     f"🌍 {esc(match.get('country_name'))}\n"
                     f"📞 Number: <code>{esc(rental.get('number'))}</code>\n"
                     f"💵 Paid: <b>{fmt_ngn(price_ngn)}</b>\n"
-                    f"💰 Balance: <b>{fmt_ngn(balance(u))}</b>\n\n"
-                    "Use this number in the app to request your code. "
-                    "We'll send it the moment it arrives — no button press "
-                    "needed.",
+                    f"🧮 Spendable: <b>{fmt_ngn(total_spendable(u))}</b>\n\n"
+                    "Use this number in the app — we'll send the code the "
+                    "moment it arrives.",
                     reply_markup=inline_kb([
                         [ibtn("🔄 Refresh", f"act:refresh:{rid}")],
                         [ibtn("📋 My numbers", "menu:active")],
@@ -1342,7 +1515,7 @@ async def _enqueue_pending(chat_id: int, msg_id: int, st: dict, u: dict,
                     "⏳ This service is already in your queue.",
                     reply_markup=main_menu(is_owner(u["uid"], st), u))
         return
-    charge_balance(u, price_ngn)
+    src = charge_balance(u, price_ngn)
     pending.append({
         "id": str(uuid.uuid4()),
         "service_id": sid,
@@ -1353,7 +1526,7 @@ async def _enqueue_pending(chat_id: int, msg_id: int, st: dict, u: dict,
         "queued_ts": time.time(),
         "state": "queued",
         "attempts": 0,
-        "buyer_notified_ts": time.time(),
+        "charge_source": src,
     })
     save_state()
 
@@ -1361,12 +1534,11 @@ async def _enqueue_pending(chat_id: int, msg_id: int, st: dict, u: dict,
                 f"⏳ <b>Please wait — server temporarily down</b>\n\n"
                 f"📱 {esc(match.get('name'))} · "
                 f"{esc(match.get('country_name'))}\n"
-                f"💵 {fmt_ngn(price_ngn)} held from your balance\n\n"
-                f"Our number supplier is briefly out of stock. Please wait "
-                f"<b>10–20 minutes</b> and do not try again — we will "
-                f"message you the moment your number is ready.\n\n"
-                f"If it doesn't complete within 30 minutes, you'll be "
-                f"refunded automatically.",
+                f"💵 {fmt_ngn(price_ngn)} held\n\n"
+                f"Supplier is briefly out of stock. Wait <b>10–20 "
+                f"minutes</b> — we'll message you the moment your number "
+                f"is ready.\n\n"
+                f"No completion in 30 minutes → automatic refund.",
                 reply_markup=inline_kb([
                     [ibtn("📋 Processing", "menu:pending")],
                     [ibtn("⬅️ Main menu", "menu:main")],
@@ -1401,16 +1573,13 @@ async def _alert_admin_low_wallet(st: dict, u: dict, match: dict,
             f"<b>{esc(match.get('name'))} · {esc(match.get('country_name'))}</b>.\n\n"
             f"💵 Buyer paid: {fmt_ngn(price_ngn)}\n"
             f"🏦 Supplier cost: {fmt_ngn(provider_price)}\n"
-            f"🧯 Safety buffer: {fmt_ngn(s.get('safety_buffer_ngn') or 0)}\n\n"
-            f"💰 Your textsms.io wallet: <b>{fmt_ngn(my_balance)}</b>\n"
+            f"💰 Your wallet: <b>{fmt_ngn(my_balance)}</b>\n"
             f"⚠️ Short by: <b>{fmt_ngn(short)}</b>\n\n"
-            f"Restock now at textsms.io. The bot will retry automatically "
-            f"and message the buyer the moment the server is live. "
-            f"If you don't restock within 30 minutes, the buyer is "
-            f"refunded automatically.",
+            f"Restock at textsms.io. Bot retries automatically. "
+            f"30-minute refund if no restock.",
             parse_mode="HTML")
     except Exception as e:
-        log.warning("admin low-wallet alert failed: %s", e)
+        log.warning("admin alert failed: %s", e)
 
 # ---------------------------------------------------------------------------
 # Poller
@@ -1446,9 +1615,7 @@ async def _poll_rental(uid: int, rid: int) -> None:
                         f"⏳ <b>Still waiting for your code</b>\n\n"
                         f"📱 {esc(rental.get('service'))}\n"
                         f"📞 <code>{esc(rental.get('number'))}</code>\n\n"
-                        f"Most codes arrive within 1–2 minutes. "
-                        f"If nothing arrives, you'll be refunded "
-                        f"automatically.",
+                        f"Most codes arrive in 1–2 min. No code → auto-refund.",
                         parse_mode="HTML",
                         reply_markup=inline_kb([
                             [ibtn("🔄 Refresh", f"act:refresh:{rid}")],
@@ -1484,8 +1651,7 @@ async def _poll_rental(uid: int, rid: int) -> None:
                         f"📱 {esc(rental.get('service'))}\n"
                         f"📞 <code>{esc(rental.get('number'))}</code>\n\n"
                         f"<b>Your code:</b>\n<code>{esc(code)}</code>\n\n"
-                        f"This number is now closed. Your balance has been "
-                        f"charged once. Enjoy!",
+                        f"Number closed. Charged once. Enjoy!",
                         parse_mode="HTML",
                         reply_markup=inline_kb([
                             [ibtn("✅ Done", f"act:done:{rid}")],
@@ -1497,17 +1663,16 @@ async def _poll_rental(uid: int, rid: int) -> None:
 
             if status == "cancelled":
                 refund = float(rental.get("price_ngn") or 0)
-                add_balance(u, refund)
+                refund_balance(u, refund, source=rental.get("charge_source"))
                 _finalize(u, rid, "cancelled", refund)
                 save_state()
                 try:
                     await bot.send_message(
                         uid,
-                        f"⏱ <b>No code received — refunded</b>\n\n"
+                        f"⏱ <b>No code — refunded</b>\n\n"
                         f"📞 <code>{esc(rental.get('number'))}</code>\n"
-                        f"The number expired without a code.\n"
                         f"💵 Refunded: <b>{fmt_ngn(refund)}</b>\n"
-                        f"💰 Balance: {fmt_ngn(balance(u))}",
+                        f"🧮 Spendable: {fmt_ngn(total_spendable(u))}",
                         parse_mode="HTML", reply_markup=back_menu())
                 except Exception:
                     pass
@@ -1638,7 +1803,7 @@ async def do_cancel(chat_id: int, msg_id: int, st: dict, u: dict,
             remaining = _cancel_countdown(rental)
             m, s = divmod(remaining, 60)
             await _edit(chat_id, msg_id,
-                        f"⏱ <b>Too early</b>\n\nCancel opens in {m}m{s:02d}s.",
+                        f"⏱ <b>Too early</b>\n\nOpens in {m}m{s:02d}s.",
                         reply_markup=inline_kb([
                             [ibtn("⬅️ Back", f"act:view:{rid}")],
                         ]))
@@ -1650,7 +1815,7 @@ async def do_cancel(chat_id: int, msg_id: int, st: dict, u: dict,
                         ]))
         elif e.code == "already_closed":
             refund = float(rental.get("price_ngn") or 0)
-            add_balance(u, refund)
+            refund_balance(u, refund, source=rental.get("charge_source"))
             _finalize(u, rid, "cancelled", refund)
             save_state()
             await _edit(chat_id, msg_id,
@@ -1662,14 +1827,14 @@ async def do_cancel(chat_id: int, msg_id: int, st: dict, u: dict,
                         reply_markup=back_menu())
         return
     refund = float(rental.get("price_ngn") or 0)
-    add_balance(u, refund)
+    refund_balance(u, refund, source=rental.get("charge_source"))
     _finalize(u, rid, "cancelled", refund)
     save_state()
     await _edit(chat_id, msg_id,
                 f"✅ <b>Cancelled</b>\n\n"
                 f"📞 {esc(rental.get('number'))}\n"
                 f"💵 Refunded: {fmt_ngn(refund)}\n"
-                f"💰 Balance: {fmt_ngn(balance(u))}",
+                f"🧮 Spendable: {fmt_ngn(total_spendable(u))}",
                 reply_markup=back_menu())
 
 async def do_done(chat_id: int, msg_id: int, st: dict, u: dict,
@@ -1751,13 +1916,10 @@ async def show_pending(chat_id: int, msg_id: int, st: dict,
         age = int((time.time() - float(p.get("queued_ts") or 0)) / 60)
         lines.append(f"⏳ {esc(p.get('service'))} · "
                      f"{esc(p.get('country'))}\n"
-                     f"   Queued {age}m ago · "
-                     f"{fmt_ngn(p.get('price_ngn'))} held")
+                     f"   Queued {age}m · {fmt_ngn(p.get('price_ngn'))} held")
     await _edit(chat_id, msg_id,
                 "⏳ <b>Processing</b>\n\n" + "\n\n".join(lines) +
-                "\n\nWe'll message you the moment each completes. "
-                "If a request takes longer than 30 minutes, you'll be "
-                "refunded.",
+                "\n\nAuto-refund if not completed in 30 minutes.",
                 reply_markup=main_menu(is_owner(u["uid"], st), u))
 
 # ---------------------------------------------------------------------------
@@ -1769,8 +1931,7 @@ async def start_deposit_flow(chat_id: int, msg_id: int, uid: int,
     cfg = settings(st).get("bank") or {}
     if not cfg.get("enabled"):
         await _edit(chat_id, msg_id,
-                    "💳 <b>Deposits temporarily disabled</b>\n\n"
-                    "Please try again later.",
+                    "💳 <b>Deposits temporarily disabled</b>",
                     reply_markup=back_menu())
         return
     ses = session(uid)
@@ -1803,20 +1964,17 @@ async def confirm_deposit_paid(chat_id: int, msg_id: int, uid: int,
     await _edit(chat_id, msg_id,
                 f"✅ Amount: <b>{fmt_ngn(amount)}</b>\n\n"
                 f"<b>Step 3/3 — Send a screenshot of your bank receipt.</b>\n\n"
-                f"The screenshot should show:\n"
-                f"• Amount transferred\n"
-                f"• Recipient: 9167685658\n"
-                f"• Date and time\n\n"
-                f"Take the screenshot in your bank app and send it here.",
+                f"Should show: amount, recipient 9167685658, date/time.\n\n"
+                f"Send the screenshot here.",
                 reply_markup=inline_kb([
                     [ibtn("❌ Cancel", "menu:main")],
                 ]))
 
 # ---------------------------------------------------------------------------
-# Referral UI (legacy ₦200 / ₦200 only)
+# Referral UI + withdrawal
 # ---------------------------------------------------------------------------
 
-async def show_referral(chat_id: int, msg_id: int, st: dict, u: dict) -> None:
+def referral_card(st: dict, u: dict) -> tuple[str, dict]:
     r = ensure_referral(u)
     cfg = settings(st).get("referral") or {}
     enabled = bool(cfg.get("enabled"))
@@ -1825,50 +1983,145 @@ async def show_referral(chat_id: int, msg_id: int, st: dict, u: dict) -> None:
     share_url = ("https://t.me/share/url"
                  f"?url={quote(link, safe='')}"
                  f"&text={quote(share_text, safe='')}")
-
     invited = sum(1 for o in st.get("users", {}).values()
                   if str((o.get("referral") or {}).get("referred_by") or "") == str(u["uid"]))
     converted = sum(1 for o in st.get("users", {}).values()
                     if str((o.get("referral") or {}).get("referred_by") or "") == str(u["uid"])
                     and int(o.get("successful_rentals") or 0) >= 1)
-    earnings = float(r.get("earnings_ngn") or 0)
+    earned = float(r.get("earnings_ngn") or 0)
+    spent = float(r.get("spent_on_numbers_ngn") or 0)
     paid = float(r.get("paid_out_ngn") or 0)
     reserved = float(r.get("reserved_ngn") or 0)
-    available = max(0.0, earnings - paid - reserved)
+    available = referral_available(u)
+
+    base = float(cfg.get("bonus_first_ngn") or 200)
+    extra = float(cfg.get("bonus_extra_ngn") or 100)
+    per_ref = base + extra
+    min_w = float(cfg.get("min_withdraw_ngn") or 500)
+    can_withdraw = enabled and available >= min_w
 
     if not enabled:
-        status_line = (
-            "🔴 <b>Referral program: PAUSED</b>\n\n"
-            "Earning is currently off. Your link still works and tracks "
-            "signups — but no bonuses are credited until admin re-enables it."
-        )
+        status = ("🔴 <b>Referral program: PAUSED</b>\n\n"
+                  "Earning is off. Your link still tracks signups — "
+                  "bonuses resume when admin re-enables it.")
+    elif can_withdraw:
+        status = "🟢 <b>Referral program: ACTIVE</b>\n\n✅ You can withdraw now."
     else:
-        status_line = (
-            f"🟢 <b>Referral program: ACTIVE</b>\n\n"
-            f"💸 First purchase: <b>{fmt_ngn(cfg.get('bonus_first_ngn') or 200)}</b>\n"
-            f"💸 Second purchase: <b>{fmt_ngn(cfg.get('bonus_second_ngn') or 200)}</b>"
-        )
+        status = (f"🟢 <b>Referral program: ACTIVE</b>\n\n"
+                  f"📊 Minimum withdrawal: <b>{fmt_ngn(min_w)}</b>.\n"
+                  f"💡 Or just spend your credit on a number — no "
+                  f"withdrawal needed.")
 
+    text = (
+        f"🎁 <b>Referral Program</b>\n\n"
+        f"Earn <b>{fmt_ngn(per_ref)}</b> when a friend you invite makes "
+        f"their <b>first purchase</b>.\n"
+        f"  └ Base {fmt_ngn(base)} + bonus {fmt_ngn(extra)}\n\n"
+        f"💡 Spend it on numbers OR withdraw it to your bank.\n\n"
+        f"<b>Your link:</b>\n<code>{esc(link)}</code>\n\n"
+        f"<b>Your Stats</b>\n"
+        f"👥 Signed up: <b>{invited}</b> · ✅ Bought: <b>{converted}</b>\n"
+        f"💸 Total earned: <b>{fmt_ngn(earned)}</b>\n"
+        f"🛍 Spent on numbers: <b>{fmt_ngn(spent)}</b>\n"
+        f"💵 Withdrawn: <b>{fmt_ngn(paid)}</b>\n"
+        f"⏳ In-flight withdrawal: <b>{fmt_ngn(reserved)}</b>\n"
+        f"🟢 <b>Available to spend/withdraw: {fmt_ngn(available)}</b>\n\n"
+        f"{status}"
+    )
     rows = [
         [{"text": "📤 Share your link", "url": share_url}],
-        [ibtn("📜 Bonus history", "ref:history")],
-        [ibtn("⬅️ Main menu", "menu:main")],
     ]
+    if enabled and available >= min_w:
+        rows.append([ibtn("💵 Withdraw", "ref:withdraw")])
+    rows.append([ibtn("📜 History", "ref:history")])
+    rows.append([ibtn("⬅️ Main menu", "menu:main")])
+    return text, inline_kb(rows)
 
+async def show_referral(chat_id: int, msg_id: int, st: dict, u: dict) -> None:
+    text, kb = referral_card(st, u)
+    await _edit(chat_id, msg_id, text, reply_markup=kb)
+
+async def show_referral_msg(chat_id: int, st: dict, u: dict) -> None:
+    text, kb = referral_card(st, u)
+    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+async def request_referral_withdrawal(chat_id: int, msg_id: int, uid: int,
+                                       st: dict, u: dict) -> None:
+    r = ensure_referral(u)
+    cfg = settings(st).get("referral") or {}
+    if not cfg.get("enabled"):
+        await _edit(chat_id, msg_id,
+                    "⚠️ Referral program is paused. Try again later.",
+                    reply_markup=back_menu())
+        return
+    available = referral_available(u)
+    min_w = float(cfg.get("min_withdraw_ngn") or 500)
+    if available < min_w:
+        await _edit(chat_id, msg_id,
+                    f"🔒 <b>Withdrawal locked</b>\n\n"
+                    f"Minimum: {fmt_ngn(min_w)}\n"
+                    f"Available: {fmt_ngn(available)}",
+                    reply_markup=back_menu())
+        return
+    ses = session(uid)
+    ses["withdraw_amount"] = available
     await _edit(chat_id, msg_id,
-                f"🎁 <b>Referral Program</b>\n\n"
-                f"Share your link. When a friend buys their first number, "
-                f"you earn <b>{fmt_ngn(cfg.get('bonus_first_ngn') or 200)}</b>. "
-                f"When they buy a second, you earn another "
-                f"<b>{fmt_ngn(cfg.get('bonus_second_ngn') or 200)}</b>.\n\n"
-                f"<b>Your link:</b>\n<code>{esc(link)}</code>\n\n"
-                f"<b>Your Stats</b>\n"
-                f"👥 Friends signed up: <b>{invited}</b>\n"
-                f"✅ Friends who bought: <b>{converted}</b>\n"
-                f"💸 Total earned: <b>{fmt_ngn(earnings)}</b>\n"
-                f"💵 Available: <b>{fmt_ngn(available)}</b>\n\n"
-                f"{status_line}",
-                reply_markup=inline_kb(rows))
+                f"💵 <b>Confirm withdrawal</b>\n\n"
+                f"Amount: <b>{fmt_ngn(available)}</b>\n"
+                f"Processing: up to 30 minutes (manual)\n\n"
+                f"This reserves your credit and requests a payout from admin.\n\n"
+                f"You can still cancel by /cancel — funds return to your "
+                f"referral pool.\n\nContinue?",
+                reply_markup=inline_kb([
+                    [ibtn("✅ Confirm", "ref:withdraw_confirm")],
+                    [ibtn("❌ Cancel", "menu:referral")],
+                ]))
+
+async def confirm_referral_withdrawal(chat_id: int, msg_id: int, uid: int,
+                                       st: dict, u: dict) -> None:
+    ses = session(uid)
+    amount = float(ses.pop("withdraw_amount", 0) or 0)
+    if amount <= 0:
+        await _edit(chat_id, msg_id, "❌ Nothing to withdraw.",
+                    reply_markup=back_menu())
+        return
+    r = ensure_referral(u)
+    available = referral_available(u)
+    if amount > available:
+        await _edit(chat_id, msg_id, "❌ Amount changed. Try again.",
+                    reply_markup=back_menu())
+        return
+    wid = "REF" + str(uuid.uuid4())[:8].upper()
+    r["reserved_ngn"] = float(r.get("reserved_ngn") or 0) + amount
+    r["events"].append({
+        "ts": time.time(), "kind": "withdrawal_requested",
+        "amount_ngn": amount, "withdrawal_id": wid, "status": "pending",
+    })
+    save_state()
+    oid = int(settings(st).get("owner_id") or 0)
+    if oid:
+        try:
+            await bot.send_message(
+                oid,
+                f"🏦 <b>Referral withdrawal request</b>\n\n"
+                f"User: <code>{u['uid']}</code> "
+                f"({esc(u.get('name') or '—')})\n"
+                f"Amount: <b>{fmt_ngn(amount)}</b>\n"
+                f"ID: <code>{wid}</code>\n\n"
+                f"Pay: <code>/paid {wid}</code>\n"
+                f"Fail: <code>/withdrawfail {wid} reason</code>",
+                parse_mode="HTML")
+        except Exception as e:
+            log.warning("withdraw notify: %s", e)
+    await _edit(chat_id, msg_id,
+                f"✅ <b>Withdrawal submitted</b>\n\n"
+                f"💵 Amount: <b>{fmt_ngn(amount)}</b>\n"
+                f"📋 ID: <code>{wid}</code>\n"
+                f"⏱ Processing: <b>up to 30 minutes</b>",
+                reply_markup=inline_kb([
+                    [ibtn("🎁 Referral", "menu:referral")],
+                    [ibtn("⬅️ Main menu", "menu:main")],
+                ]))
 
 async def show_referral_history(chat_id: int, msg_id: int, st: dict,
                                  u: dict) -> None:
@@ -1885,64 +2138,17 @@ async def show_referral_history(chat_id: int, msg_id: int, st: dict,
         amt = fmt_ngn(e.get("amount_ngn", 0))
         ts = ts_str(e.get("ts"))
         if kind == "referral_bonus":
-            ms = str(e.get("milestone", "")).replace("_", " ")
-            lines.append(f"🎉 {ts} · {ms} · +{amt}")
+            lines.append(f"🎉 {ts} · bonus · +{amt}")
+        elif kind == "withdrawal_requested":
+            stt = e.get("status", "pending")
+            icon = "✅" if stt == "paid" else "❌" if stt == "failed" else "⏳"
+            lines.append(f"{icon} {ts} · withdraw · {amt} ({stt})")
     await _edit(chat_id, msg_id,
                 "📜 <b>Referral history</b>\n\n" + "\n".join(lines),
                 reply_markup=inline_kb([
                     [ibtn("🎁 Referral", "menu:referral")],
                     [ibtn("⬅️ Main menu", "menu:main")],
                 ]))
-
-async def show_referral_msg(chat_id: int, st: dict, u: dict) -> None:
-    # Reuses the inline variant via a temp message id — easier than duplicating.
-    await bot.send_message(chat_id, "⏳ <b>Loading referral…</b>",
-                           parse_mode="HTML")
-    # We send via bot.send_message since there's no msg to edit
-    r = ensure_referral(u)
-    cfg = settings(st).get("referral") or {}
-    enabled = bool(cfg.get("enabled"))
-    link = f"https://t.me/{bot.username}?start=ref_{r['code']}"
-    share_text = "Best SMS verification bot — real numbers, instant delivery:"
-    share_url = ("https://t.me/share/url"
-                 f"?url={quote(link, safe='')}"
-                 f"&text={quote(share_text, safe='')}")
-    invited = sum(1 for o in st.get("users", {}).values()
-                  if str((o.get("referral") or {}).get("referred_by") or "") == str(u["uid"]))
-    converted = sum(1 for o in st.get("users", {}).values()
-                    if str((o.get("referral") or {}).get("referred_by") or "") == str(u["uid"])
-                    and int(o.get("successful_rentals") or 0) >= 1)
-    earnings = float(r.get("earnings_ngn") or 0)
-    paid = float(r.get("paid_out_ngn") or 0)
-    reserved = float(r.get("reserved_ngn") or 0)
-    available = max(0.0, earnings - paid - reserved)
-    if not enabled:
-        status_line = ("🔴 <b>Referral program: PAUSED</b>\n\n"
-                       "Earning is currently off. Your link still works "
-                       "and tracks signups — but no bonuses are credited "
-                       "until admin re-enables it.")
-    else:
-        status_line = (f"🟢 <b>Referral program: ACTIVE</b>\n\n"
-                       f"💸 First purchase: <b>{fmt_ngn(cfg.get('bonus_first_ngn') or 200)}</b>\n"
-                       f"💸 Second purchase: <b>{fmt_ngn(cfg.get('bonus_second_ngn') or 200)}</b>")
-    await bot.send_message(
-        chat_id,
-        f"🎁 <b>Referral Program</b>\n\n"
-        f"Share your link. When a friend buys their first number, "
-        f"you earn <b>{fmt_ngn(cfg.get('bonus_first_ngn') or 200)}</b>. "
-        f"When they buy a second, you earn another "
-        f"<b>{fmt_ngn(cfg.get('bonus_second_ngn') or 200)}</b>.\n\n"
-        f"<b>Your link:</b>\n<code>{esc(link)}</code>\n\n"
-        f"👥 Friends signed up: <b>{invited}</b>\n"
-        f"✅ Friends who bought: <b>{converted}</b>\n"
-        f"💸 Total earned: <b>{fmt_ngn(earnings)}</b>\n"
-        f"💵 Available: <b>{fmt_ngn(available)}</b>\n\n"
-        f"{status_line}",
-        parse_mode="HTML",
-        reply_markup=inline_kb([
-            [{"text": "📤 Share link", "url": share_url}],
-            [ibtn("📜 Bonus history", "ref:history")],
-        ]))
 
 # ---------------------------------------------------------------------------
 # Admin callbacks
@@ -1958,11 +2164,10 @@ async def handle_admin_cb(chat_id: int, msg_id: int, uid: int, st: dict,
     if data == "admin:set_key":
         session(uid)["admin_state"] = "set_key"
         await _edit(chat_id, msg_id,
-                    "🔑 <b>Set API Key</b>\n\n"
-                    "Send the textsms.io API key as a plain message.")
+                    "🔑 <b>Set API Key</b>\n\nSend the key as a message.")
         return
     if data == "admin:balance":
-        await _edit(chat_id, msg_id, "⏳ <b>Checking provider wallet…</b>")
+        await _edit(chat_id, msg_id, "⏳ <b>Checking wallet…</b>")
         try:
             resp = await asyncio.to_thread(lambda: gateway(st).balance())
             await _edit(chat_id, msg_id,
@@ -1985,16 +2190,15 @@ async def handle_admin_cb(chat_id: int, msg_id: int, uid: int, st: dict,
     if data == "admin:search_price":
         session(uid)["admin_state"] = "search_price"
         await _edit(chat_id, msg_id,
-                    "🔍 <b>Search & Set Price</b>\n\n"
-                    "Send a keyword — e.g. <code>whatsapp</code>.",
+                    "🔍 <b>Search & Set Price</b>\n\nSend a keyword.",
                     reply_markup=inline_kb([[ibtn("⬅️ Admin", "admin:panel")]]))
         return
     if data == "admin:bulk_prices":
         await _edit(chat_id, msg_id,
-                    "⚡ <b>Bulk Set Prices</b>\n\nChoose a filter:",
+                    "⚡ <b>Bulk Set Prices</b>\n\nChoose:",
                     reply_markup=inline_kb([
-                        [ibtn("🌍 All US services", "admin:bulk:country:US")],
-                        [ibtn("🌍 All UK services", "admin:bulk:country:UK")],
+                        [ibtn("🌍 All US", "admin:bulk:country:US")],
+                        [ibtn("🌍 All UK", "admin:bulk:country:UK")],
                         [ibtn("📱 All WhatsApp", "admin:bulk:name:whatsapp")],
                         [ibtn("📱 All Telegram", "admin:bulk:name:telegram")],
                         [ibtn("📱 All Instagram", "admin:bulk:name:instagram")],
@@ -2010,41 +2214,34 @@ async def handle_admin_cb(chat_id: int, msg_id: int, uid: int, st: dict,
         ses["bulk"] = {"kind": kind, "value": val}
         ses["admin_state"] = "bulk_price"
         await _edit(chat_id, msg_id,
-                    f"⚡ Send the naira price for all <b>{esc(val)}</b> "
-                    f"services (e.g. <code>4000</code>):")
+                    f"⚡ Send the naira price for all <b>{esc(val)}</b>:")
         return
     if data == "admin:deposits":
         await show_pending_deposits(chat_id, msg_id, st)
         return
     if data.startswith("admin:depok:"):
-        dep_id = data.split(":", 2)[2]
-        await admin_confirm_deposit(chat_id, msg_id, st, dep_id)
+        await admin_confirm_deposit(chat_id, msg_id, st,
+                                     data.split(":", 2)[2])
         return
     if data.startswith("admin:depno:"):
-        dep_id = data.split(":", 2)[2]
-        await admin_deny_deposit(chat_id, msg_id, st, dep_id)
+        await admin_deny_deposit(chat_id, msg_id, st,
+                                  data.split(":", 2)[2])
         return
     if data == "admin:addbal":
         session(uid)["admin_state"] = "addbal"
         await _edit(chat_id, msg_id,
-                    "➕ <b>Add Balance</b>\n\n"
-                    "Send: <code>USER_ID AMOUNT</code>\n"
-                    "Example: <code>7443685686 4000</code>")
+                    "➕ <b>Add Balance</b>\n\nSend: <code>USER_ID AMOUNT</code>")
         return
     if data == "admin:deduct":
         session(uid)["admin_state"] = "deduct"
         await _edit(chat_id, msg_id,
-                    "➖ <b>Deduct Balance</b>\n\n"
-                    "Send: <code>USER_ID AMOUNT</code>\n"
-                    "Example: <code>7443685686 1000</code>")
+                    "➖ <b>Deduct Balance</b>\n\nSend: <code>USER_ID AMOUNT</code>")
         return
     if data == "admin:ban":
         session(uid)["admin_state"] = "ban"
         await _edit(chat_id, msg_id,
-                    "🚫 <b>Ban / Unban</b>\n\n"
-                    "Send one of:\n"
-                    "<code>BAN USER_ID</code>\n"
-                    "<code>UNBAN USER_ID</code>")
+                    "🚫 <b>Ban / Unban</b>\n\nSend:\n"
+                    "<code>BAN USER_ID</code>\n<code>UNBAN USER_ID</code>")
         return
     if data == "admin:socials":
         await show_socials_editor(chat_id, msg_id, st)
@@ -2061,31 +2258,28 @@ async def handle_admin_cb(chat_id: int, msg_id: int, uid: int, st: dict,
         }
         await _edit(chat_id, msg_id,
                     f"{labels.get(key, key)}\n\n"
-                    f"Send the full URL (must start with https://).\n"
+                    f"Send the full URL (https://...). "
                     f"Send <code>-</code> to clear.")
         return
     if data == "admin:set_admin":
         session(uid)["admin_state"] = "set_admin_username"
         await _edit(chat_id, msg_id,
                     "📞 <b>Set Admin Username</b>\n\n"
-                    "Send your Telegram username without @ (e.g. "
-                    "<code>yourhandle</code>).\n"
-                    "Buyers will use this to DM you directly.\n\n"
+                    "Send your handle without @.\n"
                     "Send <code>-</code> to clear.")
         return
     if data == "admin:complaints":
         await show_complaints(chat_id, msg_id, st)
         return
     if data.startswith("admin:comp_view:"):
-        ticket = data.split(":", 2)[2]
-        await show_complaint_detail(chat_id, msg_id, st, ticket)
+        await show_complaint_detail(chat_id, msg_id, st,
+                                     data.split(":", 2)[2])
         return
     if data.startswith("admin:comp_reply:"):
         ticket = data.split(":", 2)[2]
         session(uid)["admin_state"] = f"reply_complaint:{ticket}"
         await _edit(chat_id, msg_id,
-                    f"✍️ <b>Reply to complaint #{ticket}</b>\n\n"
-                    f"Send your reply. It will be forwarded to the buyer.")
+                    f"✍️ <b>Reply to #{ticket}</b>\n\nSend your reply.")
         return
     if data.startswith("admin:comp_close:"):
         ticket = data.split(":", 2)[2]
@@ -2108,11 +2302,8 @@ async def handle_admin_cb(chat_id: int, msg_id: int, uid: int, st: dict,
         session(uid)["broadcast_payload"] = {}
         await _edit(chat_id, msg_id,
                     "📢 <b>Broadcast — Step 1/2</b>\n\n"
-                    "Send the text you want to broadcast.\n\n"
-                    "After this, you can attach a photo or video. "
-                    "Or send <code>-</code> to skip the text and just "
-                    "attach media.\n\n"
-                    "/cancel to abort.")
+                    "Send the text.\n\n"
+                    "Or send <code>-</code> to skip text (media only).")
         return
     if data == "admin:stats":
         await show_admin_stats(chat_id, msg_id, st)
@@ -2125,27 +2316,27 @@ async def handle_admin_cb(chat_id: int, msg_id: int, uid: int, st: dict,
         return
 
 async def show_socials_editor(chat_id: int, msg_id: int, st: dict) -> None:
-    s = settings(st)
-    soc = s.get("socials") or {}
-    def fmt_slot(key, label):
+    soc = settings(st).get("socials") or {}
+    def slot(key, label):
         v = (soc.get(key) or "").strip()
-        return f"{label}: {'✅ set' if v else '❌ not set'}"
+        return f"{label}: {'✅' if v else '❌'}"
     rows = [
-        [ibtn(fmt_slot("telegram_channel", "📢 TG Channel"), "admin:social_set:telegram_channel")],
-        [ibtn(fmt_slot("telegram_group", "💬 TG Group"), "admin:social_set:telegram_group")],
-        [ibtn(fmt_slot("whatsapp_group", "🟢 WA Group"), "admin:social_set:whatsapp_group")],
-        [ibtn(fmt_slot("whatsapp_channel", "🟩 WA Channel"), "admin:social_set:whatsapp_channel")],
+        [ibtn(slot("telegram_channel", "📢 TG Channel"),
+              "admin:social_set:telegram_channel")],
+        [ibtn(slot("telegram_group", "💬 TG Group"),
+              "admin:social_set:telegram_group")],
+        [ibtn(slot("whatsapp_group", "🟢 WA Group"),
+              "admin:social_set:whatsapp_group")],
+        [ibtn(slot("whatsapp_channel", "🟩 WA Channel"),
+              "admin:social_set:whatsapp_channel")],
         [ibtn("⬅️ Admin", "admin:panel")],
     ]
     await _edit(chat_id, msg_id,
-                "🌐 <b>Social Links</b>\n\n"
-                "Tap a slot to add or update its URL.\n"
-                "These show up to buyers in the 🌐 Channels menu.",
+                "🌐 <b>Social Links</b>\n\nTap a slot to set its URL.",
                 reply_markup=inline_kb(rows))
 
 async def show_complaints(chat_id: int, msg_id: int, st: dict) -> None:
-    s = settings(st)
-    comps = s.get("complaints") or {}
+    comps = settings(st).get("complaints") or {}
     open_items = [(k, v) for k, v in comps.items() if v.get("status") == "open"]
     if not open_items:
         await _edit(chat_id, msg_id,
@@ -2159,17 +2350,15 @@ async def show_complaints(chat_id: int, msg_id: int, st: dict) -> None:
         rows.append([ibtn(shorten(label, 55), f"admin:comp_view:{ticket}")])
     rows.append([ibtn("⬅️ Admin", "admin:panel")])
     await _edit(chat_id, msg_id,
-                f"✍️ <b>Open Complaints ({len(open_items)})</b>\n\n"
-                "Tap one to view and reply.",
+                f"✍️ <b>Open Complaints ({len(open_items)})</b>",
                 reply_markup=inline_kb(rows))
 
 async def show_complaint_detail(chat_id: int, msg_id: int, st: dict,
                                  ticket: str) -> None:
-    s = settings(st)
-    comps = s.get("complaints") or {}
+    comps = settings(st).get("complaints") or {}
     c = comps.get(ticket)
     if not c:
-        await _edit(chat_id, msg_id, "⚠️ Complaint not found.",
+        await _edit(chat_id, msg_id, "⚠️ Not found.",
                     reply_markup=inline_kb([[ibtn("⬅️ Admin", "admin:panel")]]))
         return
     replies = c.get("replies") or []
@@ -2182,12 +2371,12 @@ async def show_complaint_detail(chat_id: int, msg_id: int, st: dict,
         [ibtn("🔒 Close", f"admin:comp_close:{ticket}")],
         [ibtn("⬅️ Complaints", "admin:complaints")],
     ]
-    status = c.get("status", "open")
     await _edit(chat_id, msg_id,
                 f"✍️ <b>Complaint #{ticket}</b>\n\n"
-                f"👤 From: <code>{c.get('uid')}</code> ({esc(c.get('name','—'))})\n"
+                f"👤 <code>{c.get('uid')}</code> "
+                f"({esc(c.get('name','—'))})\n"
                 f"🕐 {ts_str(c.get('created_ts'))}\n"
-                f"📌 Status: <b>{status}</b>\n\n"
+                f"📌 Status: <b>{c.get('status','open')}</b>\n\n"
                 f"<b>Message:</b>\n{esc(c.get('text',''))}\n\n"
                 f"<b>Replies:</b>\n{reply_lines}",
                 reply_markup=inline_kb(rows))
@@ -2213,8 +2402,8 @@ async def show_admin_stats(chat_id: int, msg_id: int, st: dict) -> None:
                     and float(d.get("created_ts") or 0) >= today_start):
                 today_deposits_n += 1
                 today_deposits_sum += float(d.get("amount_ngn") or 0)
-    leg = settings(st).get("referral") or {}
     s = settings(st)
+    leg = s.get("referral") or {}
     n_comp = sum(1 for c in (s.get("complaints") or {}).values()
                  if c.get("status") == "open")
     await _edit(chat_id, msg_id,
@@ -2223,7 +2412,7 @@ async def show_admin_stats(chat_id: int, msg_id: int, st: dict) -> None:
                 f"👥 Users: <b>{total}</b>\n"
                 f"⛔ Banned: <b>{banned}</b>\n"
                 f"✅ Purchases: <b>{total_rentals}</b>\n"
-                f"🔄 Active numbers: <b>{active}</b>\n"
+                f"🔄 Active: <b>{active}</b>\n"
                 f"⏳ Queued: <b>{queued}</b>\n"
                 f"✍️ Open complaints: <b>{n_comp}</b>\n"
                 f"🎯 Referral: {'🟢 ON' if leg.get('enabled') else '🔴 OFF'}\n\n"
@@ -2235,11 +2424,11 @@ async def show_admin_stats(chat_id: int, msg_id: int, st: dict) -> None:
 
 async def show_price_editor(chat_id: int, msg_id: int, st: dict,
                              page: int) -> None:
-    await _edit(chat_id, msg_id, "⏳ <b>Loading services…</b>")
+    await _edit(chat_id, msg_id, "⏳ <b>Loading…</b>")
     services = await fetch_services_cached(st)
     if not services:
         await _edit(chat_id, msg_id,
-                    "⚠️ Could not load services. Check the API key.",
+                    "⚠️ Could not load services. Check API key.",
                     reply_markup=admin_menu(st))
         return
     per = 8
@@ -2250,9 +2439,8 @@ async def show_price_editor(chat_id: int, msg_id: int, st: dict,
     for svc in chunk:
         sid = svc.get("id")
         p = price_in_ngn(st, sid)
-        label_price = fmt_ngn(p) if p else "❌ not set"
-        label = (f"{shorten(svc.get('name'), 16)} "
-                 f"{svc.get('country')} → {label_price}")
+        lp = fmt_ngn(p) if p else "❌"
+        label = f"{shorten(svc.get('name'), 16)} {svc.get('country')} → {lp}"
         rows.append([ibtn(label, f"admin:price_set:{sid}")])
     nav = []
     if page > 0:
@@ -2262,9 +2450,7 @@ async def show_price_editor(chat_id: int, msg_id: int, st: dict,
         nav.append(ibtn("Next ▶", f"admin:prices:{page + 1}"))
     rows.append(nav)
     rows.append([ibtn("⬅️ Admin", "admin:panel")])
-    await _edit(chat_id, msg_id,
-                "💲 <b>Set Prices</b>\n\n"
-                "Tap a service to set its naira price.",
+    await _edit(chat_id, msg_id, "💲 <b>Set Prices</b>",
                 reply_markup=inline_kb(rows))
 
 async def show_price_setter(chat_id: int, msg_id: int, uid: int, st: dict,
@@ -2272,7 +2458,7 @@ async def show_price_setter(chat_id: int, msg_id: int, uid: int, st: dict,
     services = await fetch_services_cached(st)
     match = next((s for s in services if s.get("id") == sid), None)
     if not match:
-        await _edit(chat_id, msg_id, "⚠️ Service not found.",
+        await _edit(chat_id, msg_id, "⚠️ Not found.",
                     reply_markup=admin_menu(st))
         return
     provider = float(match.get("price") or 0)
@@ -2282,11 +2468,9 @@ async def show_price_setter(chat_id: int, msg_id: int, uid: int, st: dict,
     ses["admin_state"] = "price_set"
     await _edit(chat_id, msg_id,
                 f"💲 <b>{esc(match.get('name'))} · {esc(match.get('country'))}</b>\n\n"
-                f"🏦 Provider cost: <b>{fmt_ngn(provider)}</b>\n"
-                f"💵 Current price: "
-                f"<b>{fmt_ngn(current) if current else 'not set'}</b>\n\n"
-                f"Send the new naira price (e.g. <code>4000</code>).\n"
-                f"Send <code>0</code> to hide.",
+                f"🏦 Provider: <b>{fmt_ngn(provider)}</b>\n"
+                f"💵 Current: <b>{fmt_ngn(current) if current else 'not set'}</b>\n\n"
+                f"Send new naira price, or <code>0</code> to hide.",
                 reply_markup=inline_kb([[ibtn("⬅️ Prices", "admin:prices:0")]]))
 
 async def show_pending_deposits(chat_id: int, msg_id: int, st: dict) -> None:
@@ -2341,13 +2525,13 @@ async def admin_confirm_deposit(chat_id: int, msg_id: int, st: dict,
             f"✅ <b>Deposit Approved!</b>\n\n"
             f"💵 Amount: <b>{fmt_ngn(d.get('amount_ngn', 0))}</b>\n"
             f"💰 New balance: <b>{fmt_ngn(balance(tu))}</b>\n\n"
-            f"🚀 You can now buy a number.",
+            f"🚀 Buy a number now!",
             parse_mode="HTML",
             reply_markup=reply_keyboard(is_owner(target_uid, load_state())))
     except Exception as e:
         log.warning("dep confirm DM: %s", e)
     await _edit(chat_id, msg_id,
-                f"✅ <b>Approved {dep_id}</b>\n\nBuyer notified.",
+                f"✅ <b>Approved {dep_id}</b>",
                 reply_markup=admin_menu(st))
 
 async def admin_deny_deposit(chat_id: int, msg_id: int, st: dict,
@@ -2404,7 +2588,8 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
         save_state()
         await bot.send_message(
             chat_id,
-            f"✅ Admin username set to <code>{esc(v) if v != '-' else '(cleared)'}</code>.",
+            f"✅ Admin username set to "
+            f"<code>{esc(v) if v != '-' else '(cleared)'}</code>.",
             parse_mode="HTML", reply_markup=admin_menu(st))
         return
 
@@ -2419,15 +2604,13 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
             soc[key] = ""
             msg = "✅ Cleared."
         elif not v.startswith("https://"):
-            await bot.send_message(
-                chat_id, "❌ URL must start with https://")
+            await bot.send_message(chat_id, "❌ URL must start with https://")
             return
         else:
             soc[key] = v
-            msg = f"✅ Saved: {esc(v)}"
+            msg = f"✅ Saved."
         save_state()
-        await bot.send_message(chat_id, msg, parse_mode="HTML",
-                               reply_markup=admin_menu(st))
+        await bot.send_message(chat_id, msg, reply_markup=admin_menu(st))
         return
 
     if astate == "price_set":
@@ -2439,15 +2622,15 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
             if n < 0:
                 raise ValueError
         except ValueError:
-            await bot.send_message(chat_id, "❌ Send a valid number.")
+            await bot.send_message(chat_id, "❌ Invalid number.")
             return
         prices = s.setdefault("service_prices", {})
         if n == 0:
             prices.pop(str(sid), None)
-            msg = f"✅ Service {sid} hidden."
+            msg = f"✅ Hidden."
         else:
             prices[str(sid)] = n
-            msg = f"✅ Service {sid} set to {fmt_ngn(n)}."
+            msg = f"✅ Set to {fmt_ngn(n)}."
         save_state()
         await bot.send_message(chat_id, msg, reply_markup=admin_menu(st))
         return
@@ -2462,7 +2645,7 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
             if price <= 0:
                 raise ValueError
         except ValueError:
-            await bot.send_message(chat_id, "❌ Send a positive number.")
+            await bot.send_message(chat_id, "❌ Send positive number.")
             return
         services = await fetch_services_cached(st, force=True)
         prices = s.setdefault("service_prices", {})
@@ -2489,7 +2672,7 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
                    if ql in str(x.get("name") or "").lower()]
         if not matches:
             await bot.send_message(chat_id,
-                                   f"🔍 No services match '{esc(text)}'.",
+                                   f"🔍 No match for '{esc(text)}'.",
                                    parse_mode="HTML",
                                    reply_markup=admin_menu(st))
             return
@@ -2497,14 +2680,14 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
         for svc in matches[:20]:
             sid = svc.get("id")
             p = price_in_ngn(st, sid)
-            label = (f"{svc.get('name')} · {svc.get('country')} → "
-                     f"{fmt_ngn(p) if p else '❌'}")
-            rows.append([ibtn(shorten(label, 55), f"admin:price_set:{sid}")])
+            lp = fmt_ngn(p) if p else "❌"
+            rows.append([ibtn(shorten(f"{svc.get('name')} · {svc.get('country')} → {lp}", 55),
+                              f"admin:price_set:{sid}")])
         rows.append([ibtn("⬅️ Admin", "admin:panel")])
-        await bot.send_message(
-            chat_id,
-            f"🔍 {len(matches)} results. Tap one to set price:",
-            parse_mode="HTML", reply_markup=inline_kb(rows))
+        await bot.send_message(chat_id,
+                               f"🔍 {len(matches)} results.",
+                               parse_mode="HTML",
+                               reply_markup=inline_kb(rows))
         return
 
     if astate == "addbal":
@@ -2515,9 +2698,9 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
             target = int(parts[0])
             amount = float(parts[1])
         except ValueError:
-            await bot.send_message(
-                chat_id, "❌ Format: <code>USER_ID AMOUNT</code>",
-                parse_mode="HTML")
+            await bot.send_message(chat_id,
+                                   "❌ Format: <code>USER_ID AMOUNT</code>",
+                                   parse_mode="HTML")
             return
 
         def apply(sx: dict):
@@ -2527,7 +2710,7 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
 
         tu = mutate_state(apply)
         await bot.send_message(chat_id,
-                               f"✅ Added {fmt_ngn(amount)} to user {target}.\n"
+                               f"✅ Added {fmt_ngn(amount)} to {target}.\n"
                                f"New balance: {fmt_ngn(balance(tu))}",
                                reply_markup=admin_menu(st))
         return
@@ -2540,9 +2723,9 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
             target = int(parts[0])
             amount = float(parts[1])
         except ValueError:
-            await bot.send_message(
-                chat_id, "❌ Format: <code>USER_ID AMOUNT</code>",
-                parse_mode="HTML")
+            await bot.send_message(chat_id,
+                                   "❌ Format: <code>USER_ID AMOUNT</code>",
+                                   parse_mode="HTML")
             return
 
         def apply(sx: dict):
@@ -2552,7 +2735,7 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
 
         tu = mutate_state(apply)
         await bot.send_message(chat_id,
-                               f"✅ Deducted {fmt_ngn(amount)} from user {target}.\n"
+                               f"✅ Deducted {fmt_ngn(amount)} from {target}.\n"
                                f"New balance: {fmt_ngn(balance(tu))}",
                                reply_markup=admin_menu(st))
         return
@@ -2560,15 +2743,13 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
     if astate == "ban":
         parts = text.split()
         if len(parts) < 2:
-            await bot.send_message(
-                chat_id, "❌ Format: <code>BAN USER_ID</code>",
-                parse_mode="HTML")
+            await bot.send_message(chat_id, "❌ Format: BAN USER_ID")
             return
         action = parts[0].upper()
         try:
             target = int(parts[1])
         except ValueError:
-            await bot.send_message(chat_id, "❌ Invalid user ID.")
+            await bot.send_message(chat_id, "❌ Invalid ID.")
             return
         reason = " ".join(parts[2:]) or "no reason"
 
@@ -2584,10 +2765,9 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
             return tu
 
         mutate_state(apply)
-        msg = (f"⛔ Banned {target}. Reason: {esc(reason)}"
+        msg = (f"⛔ Banned {target}."
                if action == "BAN" else f"✅ Unbanned {target}.")
-        await bot.send_message(chat_id, msg, parse_mode="HTML",
-                               reply_markup=admin_menu(st))
+        await bot.send_message(chat_id, msg, reply_markup=admin_menu(st))
         return
 
     if astate.startswith("reply_complaint:"):
@@ -2595,48 +2775,40 @@ async def handle_admin_text(chat_id: int, uid: int, st: dict,
         comps = s.setdefault("complaints", {})
         c = comps.get(ticket)
         if not c:
-            await bot.send_message(chat_id, "⚠️ Complaint not found.")
+            await bot.send_message(chat_id, "⚠️ Not found.")
             return
         c.setdefault("replies", []).append({
             "ts": time.time(), "text": text, "by": "admin",
         })
         c["status"] = "answered"
         save_state()
-        # Send reply to buyer
         try:
             await bot.send_message(
                 int(c["uid"]),
-                f"📬 <b>Admin reply to your complaint #{ticket}</b>\n\n"
-                f"{esc(text)}\n\n"
-                f"Reply again from 🆘 Support if you need more help.",
+                f"📬 <b>Admin reply to complaint #{ticket}</b>\n\n"
+                f"{esc(text)}",
                 parse_mode="HTML", reply_markup=back_menu())
         except Exception as e:
             log.warning("complaint reply DM: %s", e)
         await bot.send_message(chat_id,
-                               f"✅ Reply sent to user <code>{c['uid']}</code>.",
-                               parse_mode="HTML",
+                               f"✅ Reply sent to {c['uid']}.",
                                reply_markup=admin_menu(st))
         return
 
     if astate == "broadcast_text":
         payload = session(uid).setdefault("broadcast_payload", {})
-        if text.strip() == "-":
-            payload["text"] = ""
-        else:
-            payload["text"] = text
+        payload["text"] = "" if text.strip() == "-" else text
         session(uid)["admin_state"] = "broadcast_media"
         await bot.send_message(
             chat_id,
             "📢 <b>Broadcast — Step 2/2</b>\n\n"
-            "Send a photo or video to attach. Or send <code>-</code> to "
-            "send text only.\n\n"
-            "/cancel to abort.")
+            "Send a photo or video. Or <code>-</code> for text only.")
         return
 
     if astate == "broadcast_media":
-        ses = session(uid)
-        payload = ses.get("broadcast_payload") or {}
         if text.strip() == "-":
+            ses = session(uid)
+            payload = ses.get("broadcast_payload") or {}
             await _do_broadcast(chat_id, payload, media=None)
             ses["broadcast_payload"] = {}
             ses["admin_state"] = None
@@ -2652,13 +2824,13 @@ async def _do_broadcast(chat_id: int, payload: dict,
             target = int(uid_str)
             if media:
                 if media.get("type") == "photo":
-                    await bot.send_photo(
-                        target, media["file_id"], caption=text or "",
-                        parse_mode="HTML")
+                    await bot.send_photo(target, media["file_id"],
+                                          caption=text or "",
+                                          parse_mode="HTML")
                 elif media.get("type") == "video":
-                    await bot.send_video(
-                        target, media["file_id"], caption=text or "",
-                        parse_mode="HTML")
+                    await bot.send_video(target, media["file_id"],
+                                          caption=text or "",
+                                          parse_mode="HTML")
             elif text:
                 await bot.send_message(target, text, parse_mode="HTML")
             ok += 1
@@ -2690,9 +2862,7 @@ async def on_text(update: dict) -> None:
 
     if u.get("banned") and not admin:
         await bot.send_message(
-            chat_id,
-            "⛔ <b>Your account has been suspended.</b>\n"
-            "Contact admin if you believe this is a mistake.",
+            chat_id, "⛔ <b>Your account has been suspended.</b>",
             parse_mode="HTML")
         return
 
@@ -2701,7 +2871,6 @@ async def on_text(update: dict) -> None:
         if not admin:
             ses["admin_state"] = None
             return
-        # broadcast_media is handled specially — no popping here
         if astate not in ("broadcast_media",):
             ses["admin_state"] = None
         await handle_admin_text(chat_id, uid, st, astate, text)
@@ -2711,9 +2880,14 @@ async def on_text(update: dict) -> None:
         await show_services_msg(chat_id, uid, st, "", None, 0)
         return
     if text == "💰 Balance":
-        await bot.send_message(
-            chat_id, f"💰 <b>Your balance:</b> {fmt_ngn(balance(u))}",
-            parse_mode="HTML", reply_markup=reply_keyboard(admin))
+        ref_av = referral_available(u)
+        msg = f"💰 <b>Balance:</b> {fmt_ngn(balance(u))}"
+        if ref_av > 0:
+            msg += (f"\n🎁 <b>Referral credit:</b> {fmt_ngn(ref_av)}"
+                    f"\n🧮 <b>Total spendable:</b> "
+                    f"{fmt_ngn(total_spendable(u))}")
+        await bot.send_message(chat_id, msg, parse_mode="HTML",
+                               reply_markup=reply_keyboard(admin))
         return
     if text == "📜 History":
         await send_history(chat_id, st, u)
@@ -2773,18 +2947,14 @@ async def on_text(update: dict) -> None:
                 sent = await bot.send_message(
                     oid,
                     f"✍️ <b>New Complaint #{ticket}</b>\n\n"
-                    f"👤 From: <code>{uid}</code> "
-                    f"({esc(u.get('name') or '—')})\n"
+                    f"👤 <code>{uid}</code> ({esc(u.get('name') or '—')})\n"
                     f"🕐 {ts_str(time.time())}\n\n"
-                    f"<b>Message:</b>\n{esc(text)}\n\n"
-                    f"Reply with the admin panel → ✍️ Complaints, "
-                    f"or run <code>/reply {ticket} your message</code>.",
+                    f"<b>Message:</b>\n{esc(text)}",
                     parse_mode="HTML",
                     reply_markup=inline_kb([
                         [ibtn("✍️ Reply", f"admin:comp_reply:{ticket}")],
                         [ibtn("🔒 Close", f"admin:comp_close:{ticket}")],
                     ]))
-                # Save admin message id for reply routing
                 def apply2(sx: dict):
                     comps = settings(sx).setdefault("complaints", {})
                     c = comps.get(str(ticket))
@@ -2811,11 +2981,10 @@ async def on_text(update: dict) -> None:
         cfg = settings(st).get("bank") or {}
         min_d = float(cfg.get("min_deposit_ngn") or 1000)
         if amount < min_d:
-            await bot.send_message(chat_id, f"❌ Minimum is {fmt_ngn(min_d)}.")
+            await bot.send_message(chat_id, f"❌ Minimum {fmt_ngn(min_d)}.")
             return
         if amount > 5_000_000:
-            await bot.send_message(
-                chat_id, "❌ Max ₦5,000,000. Contact admin for larger.")
+            await bot.send_message(chat_id, "❌ Max ₦5,000,000.")
             return
         ses["dep_amount"] = amount
         ses["state"] = "dep_paid_prompt"
@@ -2823,7 +2992,7 @@ async def on_text(update: dict) -> None:
             chat_id,
             f"✅ Amount: <b>{fmt_ngn(amount)}</b>\n\n"
             f"Have you transferred {fmt_ngn(amount)} to the account shown?\n\n"
-            f"Tap <b>✅ I have paid</b> once you're done.",
+            f"Tap <b>✅ I have paid</b> once done.",
             parse_mode="HTML",
             reply_markup=inline_kb([
                 [ibtn("✅ I have paid", "topup:confirm_paid")],
@@ -2921,7 +3090,6 @@ async def on_photo(update: dict) -> None:
         await bot.send_message(chat_id, "⛔ Account suspended.")
         return
 
-    # admin broadcast media
     if admin and ses.get("admin_state") == "broadcast_media":
         photos = m.get("photo") or []
         if not photos:
@@ -2941,7 +3109,7 @@ async def on_photo(update: dict) -> None:
     amount = float(ses.pop("dep_amount", 0) or 0)
     if amount <= 0:
         ses["state"] = None
-        await bot.send_message(chat_id, "❌ Something went wrong. Start again.")
+        await bot.send_message(chat_id, "❌ Something went wrong.")
         return
     photos = m.get("photo") or []
     if not photos:
@@ -2969,11 +3137,9 @@ async def on_photo(update: dict) -> None:
                 photo=photo["file_id"],
                 caption=(
                     f"💰 <b>New Deposit</b>\n\n"
-                    f"User: <code>{u['uid']}</code> "
-                    f"({esc(payer_name)})\n"
+                    f"User: <code>{u['uid']}</code> ({esc(payer_name)})\n"
                     f"Amount: <b>{fmt_ngn(amount)}</b>\n"
-                    f"ID: <code>{dep_id}</code>\n\n"
-                    f"Approve with the buttons below."),
+                    f"ID: <code>{dep_id}</code>"),
                 parse_mode="HTML",
                 reply_markup=inline_kb([
                     [ibtn("✅ Approve", f"admin:depok:{dep_id}"),
@@ -2986,7 +3152,7 @@ async def on_photo(update: dict) -> None:
         f"⏳ <b>Wait for Approval</b>\n\n"
         f"💵 Amount: <b>{fmt_ngn(amount)}</b>\n"
         f"🆔 ID: <code>{dep_id}</code>\n\n"
-        f"Admin will verify and credit you within a few minutes.",
+        f"Admin will verify and credit you shortly.",
         parse_mode="HTML", reply_markup=reply_keyboard(admin))
 
 async def on_video(update: dict) -> None:
@@ -3006,45 +3172,6 @@ async def on_video(update: dict) -> None:
         await _do_broadcast(chat_id, payload, media=media)
         ses["broadcast_payload"] = {}
         ses["admin_state"] = None
-        return
-
-# ---------------------------------------------------------------------------
-# Owner commands
-# ---------------------------------------------------------------------------
-
-async def cmd_reply(update: dict) -> None:
-    m = update["message"]
-    st = load_state()
-    if not is_owner(m["from"]["id"], st):
-        return
-    parts = (m.get("text") or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await bot.send_message(m["chat"]["id"],
-                               "Usage: /reply <ticket> <message>")
-        return
-    ticket = parts[1].lstrip("#")
-    body = parts[2]
-    s = settings(st)
-    comps = s.setdefault("complaints", {})
-    c = comps.get(ticket)
-    if not c:
-        await bot.send_message(m["chat"]["id"], "❌ Ticket not found.")
-        return
-    c.setdefault("replies", []).append({
-        "ts": time.time(), "text": body, "by": "admin",
-    })
-    c["status"] = "answered"
-    save_state()
-    try:
-        await bot.send_message(
-            int(c["uid"]),
-            f"📬 <b>Admin reply to your complaint #{ticket}</b>\n\n"
-            f"{esc(body)}",
-            parse_mode="HTML", reply_markup=back_menu())
-    except Exception as e:
-        log.warning("reply DM: %s", e)
-    await bot.send_message(m["chat"]["id"],
-                           f"✅ Reply sent to user {c['uid']}.")
 
 # ---------------------------------------------------------------------------
 # Background: queue worker
@@ -3083,7 +3210,8 @@ async def queue_worker() -> None:
                     age_min = (time.time()
                                - float(p.get("queued_ts") or 0)) / 60
                     if age_min >= max_min:
-                        add_balance(u, float(p.get("price_ngn") or 0))
+                        price = float(p.get("price_ngn") or 0)
+                        refund_balance(u, price, source=p.get("charge_source"))
                         u["pending_rentals"] = [
                             x for x in u.get("pending_rentals", [])
                             if x["id"] != p["id"]]
@@ -3095,7 +3223,7 @@ async def queue_worker() -> None:
                                 f"{esc(p.get('service'))} · "
                                 f"{esc(p.get('country'))}\n\n"
                                 f"Supplier issues. Refunded "
-                                f"<b>{fmt_ngn(p.get('price_ngn'))}</b>.",
+                                f"<b>{fmt_ngn(price)}</b>.",
                                 parse_mode="HTML", reply_markup=back_menu())
                         except Exception:
                             pass
@@ -3206,6 +3334,8 @@ _COMMANDS = {
     "/balance": cmd_balance,
     "/history": cmd_history,
     "/admin": cmd_admin,
+    "/paid": cmd_paid,
+    "/withdrawfail": cmd_withdrawfail,
     "/reply": cmd_reply,
 }
 
@@ -3264,9 +3394,6 @@ async def bootstrap_commands() -> None:
 async def init_handlers() -> None:
     def is_message(u): return "message" in u
     def is_callback(u): return "callback_query" in u
-    def is_precheckout(u): return "pre_checkout_query" in u
-
-    bot.add_handler(is_precheckout, lambda u: None)
     bot.add_handler(is_callback, on_callback)
     bot.add_handler(is_message, dispatch_message)
 
