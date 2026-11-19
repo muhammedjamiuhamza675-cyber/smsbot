@@ -3,19 +3,19 @@ textsms_bot.py — Telegram bot for textsms.io virtual number rentals.
 Raw Bot API + infinite polling loop. No Application/Updater framework.
 Railway-ready. Naira only. Admin-approved deposits. Auto-finish on code.
 
-Referral (single system):
-    • Inviter gets ₦200 + ₦100 = ₦300 when a referred user makes their
-      FIRST purchase (only).
-    • Bonus is credited to the inviter's referral pool, spendable on
-      numbers OR withdrawable via admin manual payout.
+Top-up methods:
+    🏦 Bank transfer (3-step, admin-approved)
+    ⭐ Telegram Stars (instant, in-app payment)
 
-Deposit flow: 3 steps (account shown first, then amount, then screenshot).
+Referral: ₦200 base + ₦100 extra = ₦300 on referred user's FIRST purchase.
+Bonus lands in referral pool; spendable on numbers OR withdrawable via admin.
 
 Admin extras:
-    • Social links editor (TG channel/group, WA group/channel)
-    • Complaint inbox with reply routing (in-bot or /reply)
-    • Broadcast with text + photo + video
-    • /paid and /withdrawfail for manual payout release
+    • Social links editor
+    • Complaint inbox with /reply routing
+    • Broadcast (text + photo + video)
+    • Stars on/off toggle
+    • /paid + /withdrawfail for manual payout release
 """
 
 from __future__ import annotations
@@ -98,21 +98,20 @@ WELCOME_TEXT = (
 HELP_TEXT = (
     "ℹ️ <b>How to use this bot</b>\n\n"
     "<b>Step 1 — Add money</b>\n"
-    "Tap 💳 Add Money → transfer to the account shown → type the amount "
-    "you sent → tap ✅ I have paid → send a screenshot of your bank "
-    "receipt → wait for admin approval.\n\n"
+    "Tap 💳 Add Money → choose 🏦 Bank Transfer or ⭐ Telegram Stars.\n"
+    "• Bank: transfer → type amount → ✅ I have paid → send screenshot\n"
+    "• Stars: pick a pack → pay in Telegram → balance credited instantly\n\n"
     "<b>Step 2 — Buy a number</b>\n"
-    "Tap 📱 Buy. Browse the services and tap the one you need.\n\n"
+    "Tap 📱 Buy. Browse and tap the service you need.\n\n"
     "<b>Step 3 — Get your code</b>\n"
-    "Enter the number in the app you're verifying. We watch the number "
-    "24/7. The moment the code arrives, we send it here automatically.\n\n"
+    "Enter the number in the app. We watch 24/7 and send the code here "
+    "the moment it arrives.\n\n"
     "<b>Step 4 — Refunds</b>\n"
-    "No code? Full refund, automatic. You can also cancel manually "
-    "after 2 minutes.\n\n"
+    "No code → full auto-refund. Manual cancel after 2 minutes.\n\n"
     "<b>🎁 Referral program</b>\n"
     "Invite friends. When a friend buys their first number, you earn "
-    "<b>₦300</b> instantly. Spend it on numbers or withdraw it to your "
-    "bank — your choice.\n\n"
+    "<b>₦300</b> (₦200 + ₦100 bonus) instantly. Spend it on numbers OR "
+    "withdraw it to your bank.\n\n"
     "<b>Bottom menu</b>\n"
     "📱 Buy · 💰 Balance · 💳 Add Money · 📜 History\n"
     "🔄 Active · 🌐 Channels · 🎁 Referral · 🆘 Support · ℹ️ Help\n\n"
@@ -419,12 +418,17 @@ SETTINGS_DEFAULT = {
     "balance_cache_ttl": 30,
     "service_prices": {},
     "bank": {
-        "enabled": True,
-        "bank_name": "PayRep MFB",
-        "account_number": "9167685658",
-        "account_name": "HAMZA JAMIU MUHAMMED",
-        "min_deposit_ngn": 1000,
-    },
+    "enabled": True,
+    "bank_name": "OPay",
+    "account_number": "9167685658",
+    "account_name": "HAMZA JAMIU MUHAMMED",
+    "min_deposit_ngn": 1000,
+},
+    "stars_packs": [
+        [50, 650, "₦650"],
+        [150, 1950, "₦1,950"],
+        [500, 6500, "₦6,500"],
+    ],
     "referral": {
         "enabled": False,
         "bonus_first_ngn": 200,
@@ -534,8 +538,6 @@ def add_balance(u: dict, n: float) -> None:
         u["balance"] = max(0.0, balance(u) + float(n))
 
 def charge_balance(u: dict, n: float) -> dict:
-    """Charge spendable total: drain real balance first, then referral pool.
-    Returns {'from_balance': x, 'from_referral': y}."""
     n = float(n)
     with _STATE_LOCK:
         from_bal = min(balance(u), n)
@@ -551,8 +553,6 @@ def charge_balance(u: dict, n: float) -> dict:
         return {"from_balance": from_bal, "from_referral": from_ref}
 
 def refund_balance(u: dict, n: float, source: dict | None = None) -> None:
-    """Refund a charge. If source dict is provided, put money back where it
-    came from; otherwise, refund to real balance."""
     n = float(n)
     if not n:
         return
@@ -631,7 +631,7 @@ async def fetch_services_cached(st: dict, force: bool = False) -> list[dict]:
         return _CATALOGUE_CACHE["services"]
 
 # ---------------------------------------------------------------------------
-# Referral — ₦300 on referred user's FIRST purchase only
+# Referral — ₦200 + ₦100 = ₦300 on referred user's FIRST purchase
 # ---------------------------------------------------------------------------
 
 def ensure_referral(u: dict) -> dict:
@@ -658,8 +658,6 @@ def find_referral_owner(st: dict, code: str) -> int | None:
     return None
 
 def apply_referral_bonus(st: dict, buyer_uid: int, rental_id: int) -> dict | None:
-    """Credit the inviter ₦200 + ₦100 = ₦300 on the referred user's FIRST
-    purchase only. No second milestone."""
     buyer = get_user(st, buyer_uid)
     r = ensure_referral(buyer)
     inviter_uid = r.get("referred_by")
@@ -771,6 +769,7 @@ def admin_menu(st: dict) -> dict:
     key_set = "✅ SET" if s.get("api_key") else "❌ MISSING"
     leg_on = "🟢 ON" if (s.get("referral") or {}).get("enabled") else "🔴 OFF"
     maint = "🟠 ON" if s.get("maintenance") else "🟢 OFF"
+    stars_on = "🟢 ON" if (s.get("stars_packs") or []) else "🔴 OFF"
     n_dep = sum(
         1 for u in st.get("users", {}).values()
         for d in (u.get("deposits") or []) if d.get("status") == "pending"
@@ -794,6 +793,7 @@ def admin_menu(st: dict) -> dict:
          ibtn("📞 Set Admin Username", "admin:set_admin")],
         [ibtn(comp_label, "admin:complaints")],
         [ibtn(f"🎯 Referral: {leg_on}", "admin:toggle_legacy")],
+        [ibtn(f"⭐ Stars: {stars_on}", "admin:toggle_stars")],
         [ibtn("📢 Broadcast", "admin:broadcast"),
          ibtn("📊 Live Stats", "admin:stats")],
         [ibtn(f"🚧 Maintenance: {maint}", "admin:toggle_maint")],
@@ -1194,7 +1194,12 @@ async def on_callback(update: dict) -> None:
     elif data == "menu:topup":
         await start_deposit_flow(chat_id, msg_id, uid, st, u)
     elif data == "topup:bank":
-        await start_deposit_flow(chat_id, msg_id, uid, st, u)
+        await start_bank_flow(chat_id, msg_id, uid, st, u)
+    elif data == "topup:stars":
+        await show_stars_menu(chat_id, msg_id, st, u)
+    elif data.startswith("topup:stars:"):
+        _, _, stars_s, naira_s = data.split(":")
+        await send_stars_invoice(chat_id, int(stars_s), float(naira_s))
     elif data == "topup:confirm_paid":
         await confirm_deposit_paid(chat_id, msg_id, uid, st, u)
     elif data == "menu:referral":
@@ -1414,14 +1419,10 @@ async def _execute_rent(chat_id: int | None, msg_id: int | None, st: dict,
                         reply_markup=back_menu())
         return False
 
-    # charge BEFORE marking successful_rentals so referral can see
-    # "done == 1" only after a successful rental (rental exists).
     charge_src = None
     if not from_queue:
         charge_src = charge_balance(u, price_ngn)
 
-    # increment successful_rentals AFTER the charge — this is what triggers
-    # the referral bonus for the inviter (buyer's first purchase).
     prev_done = int(u.get("successful_rentals") or 0)
     u["successful_rentals"] = prev_done + 1
 
@@ -1923,23 +1924,51 @@ async def show_pending(chat_id: int, msg_id: int, st: dict,
                 reply_markup=main_menu(is_owner(u["uid"], st), u))
 
 # ---------------------------------------------------------------------------
-# Deposit flow (3 steps)
+# Deposit flow (bank 3-step + Stars)
 # ---------------------------------------------------------------------------
 
 async def start_deposit_flow(chat_id: int, msg_id: int, uid: int,
                               st: dict, u: dict) -> None:
+    s = settings(st)
+    cfg = s.get("bank") or {}
+    packs = s.get("stars_packs") or []
+    bank_ok = bool(cfg.get("enabled"))
+    stars_ok = bool(packs)
+    if not bank_ok and not stars_ok:
+        await _edit(chat_id, msg_id,
+                    "💳 <b>Deposits temporarily disabled</b>",
+                    reply_markup=back_menu())
+        return
+    if bank_ok and not stars_ok:
+        await start_bank_flow(chat_id, msg_id, uid, st, u)
+        return
+    rows = []
+    if bank_ok:
+        rows.append([ibtn("🏦 Bank Transfer", "topup:bank")])
+    if stars_ok:
+        rows.append([ibtn("⭐ Telegram Stars", "topup:stars")])
+    rows.append([ibtn("❌ Cancel", "menu:main")])
+    await _edit(chat_id, msg_id,
+                f"💳 <b>Add Money</b>\n\n"
+                f"💰 Balance: <b>{fmt_ngn(balance(u))}</b>\n"
+                f"🧮 Total spendable: <b>{fmt_ngn(total_spendable(u))}</b>\n\n"
+                f"Choose a payment method:",
+                reply_markup=inline_kb(rows))
+
+async def start_bank_flow(chat_id: int, msg_id: int, uid: int,
+                           st: dict, u: dict) -> None:
     cfg = settings(st).get("bank") or {}
     if not cfg.get("enabled"):
         await _edit(chat_id, msg_id,
-                    "💳 <b>Deposits temporarily disabled</b>",
+                    "🏦 Bank transfer is disabled.",
                     reply_markup=back_menu())
         return
     ses = session(uid)
     ses["state"] = "dep_amount"
     ses.pop("dep_amount", None)
     await _edit(chat_id, msg_id,
-                f"💳 <b>Add Money</b>\n\n"
-                f"💰 Current balance: <b>{fmt_ngn(balance(u))}</b>\n\n"
+                f"🏦 <b>Bank Transfer</b>\n\n"
+                f"💰 Balance: <b>{fmt_ngn(balance(u))}</b>\n\n"
                 f"<b>Step 1/3 — Transfer to this account:</b>\n"
                 f"🏛 {esc(cfg.get('bank_name'))}\n"
                 f"🔢 <code>{esc(cfg.get('account_number'))}</code>\n"
@@ -1948,6 +1977,7 @@ async def start_deposit_flow(chat_id: int, msg_id: int, uid: int,
                 f"After transferring, type the amount you sent "
                 f"(e.g. <code>4000</code>):",
                 reply_markup=inline_kb([
+                    [ibtn("⬅️ Back", "menu:topup")],
                     [ibtn("❌ Cancel", "menu:main")],
                 ]))
 
@@ -1969,6 +1999,106 @@ async def confirm_deposit_paid(chat_id: int, msg_id: int, uid: int,
                 reply_markup=inline_kb([
                     [ibtn("❌ Cancel", "menu:main")],
                 ]))
+
+async def show_stars_menu(chat_id: int, msg_id: int, st: dict,
+                           u: dict) -> None:
+    packs = settings(st).get("stars_packs") or []
+    if not packs:
+        await _edit(chat_id, msg_id,
+                    "⭐ Telegram Stars is disabled.",
+                    reply_markup=back_menu())
+        return
+    rows = []
+    for stars, naira, label in packs:
+        rows.append([ibtn(f"⭐ {stars} Stars → {label}",
+                          f"topup:stars:{stars}:{naira}")])
+    rows.append([ibtn("⬅️ Back", "menu:topup")])
+    await _edit(chat_id, msg_id,
+                f"⭐ <b>Telegram Stars</b>\n\n"
+                f"💰 Balance: <b>{fmt_ngn(balance(u))}</b>\n\n"
+                f"Pay with Stars — Telegram handles payment, balance is "
+                f"credited instantly.\n\n"
+                f"Choose a pack:",
+                reply_markup=inline_kb(rows))
+
+async def send_stars_invoice(chat_id: int, stars: int, naira: float) -> None:
+    try:
+        await bot._call(
+            "sendInvoice",
+            chat_id=chat_id,
+            title=f"Top up {fmt_ngn(naira)}",
+            description=f"Add {fmt_ngn(naira)} to your bot balance "
+                        f"via Telegram Stars.",
+            payload=f"topup:stars:{stars}:{int(naira)}",
+            provider_token="",
+            currency="XTR",
+            prices=json.dumps([
+                {"label": f"Top up {fmt_ngn(naira)}", "amount": stars}
+            ]),
+        )
+    except Exception as e:
+        log.warning("sendInvoice failed: %s", e)
+        await bot.send_message(
+            chat_id,
+            f"❌ Could not create Stars invoice.\n"
+            f"Try again, or use bank transfer.",
+            parse_mode="HTML", reply_markup=back_menu())
+
+async def on_pre_checkout(update: dict) -> None:
+    q = update["pre_checkout_query"]
+    payload = q.get("invoice_payload") or ""
+    ok = payload.startswith("topup:stars:")
+    params = {"pre_checkout_query_id": q["id"], "ok": ok}
+    if not ok:
+        params["error_message"] = "Invalid payment request."
+    try:
+        await bot._call("answerPreCheckoutQuery", **params)
+    except Exception as e:
+        log.warning("answerPreCheckoutQuery failed: %s", e)
+
+async def on_successful_payment(update: dict) -> None:
+    m = update["message"]
+    sp = m.get("successful_payment") or {}
+    uid = m["from"]["id"]
+    chat_id = m["chat"]["id"]
+    payload = sp.get("invoice_payload") or ""
+    if not payload.startswith("topup:stars:"):
+        return
+    try:
+        parts = payload.split(":")
+        stars = int(parts[2])
+        naira = float(parts[3])
+    except (ValueError, IndexError):
+        log.warning("bad invoice payload: %s", payload)
+        return
+
+    def apply(s: dict):
+        u = get_user(s, uid)
+        add_balance(u, naira)
+        u.setdefault("payments", []).append({
+            "id": str(uuid.uuid4()),
+            "rail": "stars",
+            "stars": stars,
+            "naira": naira,
+            "charge_id": sp.get("telegram_payment_charge_id"),
+            "ts": time.time(),
+        })
+        return u
+
+    u = mutate_state(apply)
+    admin = is_owner(uid, load_state())
+    try:
+        await bot.send_message(
+            chat_id,
+            f"✅ <b>Top-up complete!</b>\n\n"
+            f"⭐ Stars paid: <b>{stars}</b>\n"
+            f"💵 Credited: <b>{fmt_ngn(naira)}</b>\n"
+            f"💰 Balance: <b>{fmt_ngn(balance(u))}</b>\n"
+            f"🧮 Total spendable: <b>{fmt_ngn(total_spendable(u))}</b>\n\n"
+            f"🚀 You can buy a number now.",
+            parse_mode="HTML", reply_markup=reply_keyboard(admin))
+    except Exception as e:
+        log.warning("stars success DM: %s", e)
 
 # ---------------------------------------------------------------------------
 # Referral UI + withdrawal
@@ -2047,7 +2177,6 @@ async def show_referral_msg(chat_id: int, st: dict, u: dict) -> None:
 
 async def request_referral_withdrawal(chat_id: int, msg_id: int, uid: int,
                                        st: dict, u: dict) -> None:
-    r = ensure_referral(u)
     cfg = settings(st).get("referral") or {}
     if not cfg.get("enabled"):
         await _edit(chat_id, msg_id,
@@ -2070,8 +2199,7 @@ async def request_referral_withdrawal(chat_id: int, msg_id: int, uid: int,
                 f"Amount: <b>{fmt_ngn(available)}</b>\n"
                 f"Processing: up to 30 minutes (manual)\n\n"
                 f"This reserves your credit and requests a payout from admin.\n\n"
-                f"You can still cancel by /cancel — funds return to your "
-                f"referral pool.\n\nContinue?",
+                f"Continue?",
                 reply_markup=inline_kb([
                     [ibtn("✅ Confirm", "ref:withdraw_confirm")],
                     [ibtn("❌ Cancel", "menu:referral")],
@@ -2265,7 +2393,7 @@ async def handle_admin_cb(chat_id: int, msg_id: int, uid: int, st: dict,
         session(uid)["admin_state"] = "set_admin_username"
         await _edit(chat_id, msg_id,
                     "📞 <b>Set Admin Username</b>\n\n"
-                    "Send your handle without @.\n"
+                    "Send your handle without @. "
                     "Send <code>-</code> to clear.")
         return
     if data == "admin:complaints":
@@ -2293,6 +2421,22 @@ async def handle_admin_cb(chat_id: int, msg_id: int, uid: int, st: dict,
     if data == "admin:toggle_legacy":
         leg = s.setdefault("referral", {})
         leg["enabled"] = not leg.get("enabled")
+        save_state()
+        await _edit(chat_id, msg_id, "👑 <b>Admin Panel</b>",
+                    reply_markup=admin_menu(st))
+        return
+    if data == "admin:toggle_stars":
+        packs = s.setdefault("stars_packs", [])
+        if packs:
+            s["stars_packs_disabled_backup"] = packs
+            s["stars_packs"] = []
+        else:
+            s["stars_packs"] = s.get("stars_packs_disabled_backup") or [
+                [50, 650, "₦650"],
+                [150, 1950, "₦1,950"],
+                [500, 6500, "₦6,500"],
+            ]
+            s.pop("stars_packs_disabled_backup", None)
         save_state()
         await _edit(chat_id, msg_id, "👑 <b>Admin Panel</b>",
                     reply_markup=admin_menu(st))
@@ -2406,6 +2550,7 @@ async def show_admin_stats(chat_id: int, msg_id: int, st: dict) -> None:
     leg = s.get("referral") or {}
     n_comp = sum(1 for c in (s.get("complaints") or {}).values()
                  if c.get("status") == "open")
+    stars_on = bool(s.get("stars_packs"))
     await _edit(chat_id, msg_id,
                 f"📊 <b>Live Stats</b>\n\n"
                 f"<b>All Time</b>\n"
@@ -2415,7 +2560,8 @@ async def show_admin_stats(chat_id: int, msg_id: int, st: dict) -> None:
                 f"🔄 Active: <b>{active}</b>\n"
                 f"⏳ Queued: <b>{queued}</b>\n"
                 f"✍️ Open complaints: <b>{n_comp}</b>\n"
-                f"🎯 Referral: {'🟢 ON' if leg.get('enabled') else '🔴 OFF'}\n\n"
+                f"🎯 Referral: {'🟢 ON' if leg.get('enabled') else '🔴 OFF'}\n"
+                f"⭐ Stars: {'🟢 ON' if stars_on else '🔴 OFF'}\n\n"
                 f"<b>Last 24h</b>\n"
                 f"✅ Purchases: <b>{today_rentals}</b>\n"
                 f"💰 Deposits: <b>{today_deposits_n}</b> "
@@ -3362,6 +3508,7 @@ async def dispatch_message(update: dict) -> None:
         await on_video(update)
         return
     if m.get("successful_payment"):
+        await on_successful_payment(update)
         return
     if m.get("text", "").startswith("/"):
         await dispatch_command(update)
@@ -3394,6 +3541,8 @@ async def bootstrap_commands() -> None:
 async def init_handlers() -> None:
     def is_message(u): return "message" in u
     def is_callback(u): return "callback_query" in u
+    def is_precheckout(u): return "pre_checkout_query" in u
+    bot.add_handler(is_precheckout, on_pre_checkout)
     bot.add_handler(is_callback, on_callback)
     bot.add_handler(is_message, dispatch_message)
 
